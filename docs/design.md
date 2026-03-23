@@ -6,7 +6,7 @@ A prototype job worker service that runs arbitrary Linux processes on the host m
 
 ## 2. Scope
 
-**In scope:** Start/stop/status/list/stream-output for arbitrary processes, mTLS authentication, role-based authorization derived from client certificates, efficient output streaming with concurrent client support.
+**In scope:** Start/stop/status/stream-output for arbitrary processes, mTLS authentication, role-based authorization derived from client certificates, efficient output streaming with concurrent client support.
 
 **Out of scope:** cgroup-based resource control and guaranteed child process tree cleanup (Level 5). No persistence, high availability, or horizontal scaling — this is a single-node prototype. Out-of-scope items are noted as TODOs where relevant.
 
@@ -31,13 +31,17 @@ _TODO: Graceful server shutdown — stop accepting new RPCs, drain active stream
 
 ```
 jobworker/
-  cmd/server/       — gRPC server entrypoint
-  cmd/jobctl/       — CLI client entrypoint
-  pkg/worker/       — library (no gRPC dependency)
-  pkg/auth/         — interceptor + role mapping
-  proto/            — protobuf definitions
-  certs/            — pre-generated certificates
+  cmd/server/        — entrypoint (flags, wiring)
+  cmd/jobctl/        — entrypoint (flags, wiring)
+  internal/server/   — gRPC service handler
+  internal/client/   — gRPC client wrapper
+  pkg/worker/        — library (no gRPC dependency)
+  pkg/auth/          — interceptor + role mapping
+  proto/             — protobuf definitions
+  certs/             — pre-generated certificates
 ```
+
+The `cmd/` packages are thin entrypoints — flag parsing, TLS setup, and wiring only. The gRPC service implementation (bridging proto types to the worker library) lives in `internal/server/`, and the gRPC client wrapper used by the CLI lives in `internal/client/`. This keeps the gRPC layer independently testable.
 
 ## 4. API Design
 
@@ -51,7 +55,6 @@ service JobWorker {
   rpc Start(StartRequest) returns (StartResponse);
   rpc Stop(StopRequest) returns (StopResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
-  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
   rpc StreamOutput(StreamOutputRequest) returns (stream StreamOutputResponse);
 }
 
@@ -77,25 +80,14 @@ message GetStatusRequest {
 message GetStatusResponse {
   string job_id = 1;
   JobStatus status = 2;
-  int32 exit_code = 3;     // Only meaningful when status == JOB_STATUS_EXITED
-  bool stopped_by_user = 4;
+  int32 exit_code = 3;  // Meaningful when status is EXITED or STOPPED
 }
 
 enum JobStatus {
   JOB_STATUS_UNSPECIFIED = 0;
   JOB_STATUS_RUNNING = 1;
   JOB_STATUS_EXITED = 2;
-}
-
-message ListJobsRequest {}
-
-message ListJobsResponse {
-  repeated JobSummary jobs = 1;
-}
-
-message JobSummary {
-  string job_id = 1;
-  JobStatus status = 2;
+  JOB_STATUS_STOPPED = 3;
 }
 
 message StreamOutputRequest {
@@ -109,17 +101,17 @@ message StreamOutputResponse {
 
 ### Start Semantics
 
-`Start` validates and execs the process synchronously. If exec fails (binary not found, permission denied), the RPC returns an error immediately — no job is created. Once the process is running, a UUID is assigned and returned. The process runs in the background; the client uses `GetStatus` or `StreamOutput` to follow progress. No shell is involved — `command` and `args` are passed directly to `exec`. Go's `exec.Command` performs PATH lookup by default, so both absolute paths and bare command names work.
+`Start` validates and execs the process synchronously. If exec fails (binary not found, permission denied), the RPC returns an error immediately — no job is created. Once the process is running, a UUID is assigned (via `github.com/google/uuid`, v4) and returned. The process runs in the background; the client uses `GetStatus` or `StreamOutput` to follow progress. No shell is involved — `command` and `args` are passed directly to `exec`. Go's `exec.Command` performs PATH lookup by default, so both absolute paths and bare command names work.
 
 ### gRPC Error Mapping
 
-| Scenario                      | Status Code           |
-| ----------------------------- | --------------------- |
-| Job not found                 | `NOT_FOUND`           |
-| Unauthorized / unknown CN     | `PERMISSION_DENIED`   |
-| Stop on already-exited job    | `FAILED_PRECONDITION` |
-| Missing fields / exec failure | `INVALID_ARGUMENT`    |
-| Internal error                | `INTERNAL`            |
+| Scenario                       | Status Code           |
+| ------------------------------ | --------------------- |
+| Job not found                  | `NOT_FOUND`           |
+| Unauthorized / unknown CN      | `PERMISSION_DENIED`   |
+| Stop on already-terminated job | `FAILED_PRECONDITION` |
+| Missing fields / exec failure  | `INVALID_ARGUMENT`    |
+| Internal error                 | `INTERNAL`            |
 
 ## 5. Security
 
@@ -147,8 +139,8 @@ The server sets `ClientAuth: tls.RequireAndVerifyClientCert` with the CA as the 
 
 The client certificate's Common Name (CN) determines the role:
 
-- CN `admin` → **admin** role: Start, Stop, GetStatus, ListJobs, StreamOutput
-- CN `viewer` → **viewer** role: GetStatus, ListJobs, StreamOutput only
+- CN `admin` → **admin** role: Start, Stop, GetStatus, StreamOutput
+- CN `viewer` → **viewer** role: GetStatus, StreamOutput only
 - Any other CN → rejected with `PERMISSION_DENIED`
 
 Enforced in a gRPC unary/stream interceptor that extracts the CN from the peer's verified TLS certificate. Role mapping is hardcoded for the prototype. All authenticated users can see and interact with all jobs regardless of who started them.
@@ -185,17 +177,19 @@ Streaming a completed job is a valid use case: `StreamOutput` replays the full b
 offset = 0
 loop:
   data, done, notifyCh = buffer.ReadFrom(offset)  // under lock
-  if len(data) > 0:
-    send data in ≤32KB chunks
-    offset += len(data)
-  if done and offset == buffer.Len():
+  for len(data) > 0:
+    chunk = data[:min(len(data), 32KB)]
+    stream.Send(chunk)
+    data = data[len(chunk):]
+    offset += len(chunk)
+  if done and no unread data:
     return EOF
   select:
     case <-notifyCh:   continue loop
     case <-ctx.Done(): return ctx.Err()
 ```
 
-Output is sent as raw `bytes` — binary-safe, no encoding or framing assumptions. Chunk size is hardcoded at 32KB per gRPC message.
+The gRPC `StreamOutput` handler drives this loop server-side: it pulls data from the buffer via `ReadFrom` and pushes chunks to the client via `stream.Send()`. The buffer itself is passive. Output is sent as raw `bytes` — binary-safe, no encoding or framing assumptions. Chunk size is hardcoded at 32KB per gRPC message.
 
 _TODO: Make chunk size configurable._
 
@@ -203,67 +197,61 @@ _TODO: Make chunk size configurable._
 
 ### Start
 
-1. Create `exec.Cmd` with `SysProcAttr{Setpgid: true}` (new process group).
-2. Set `cmd.Stdout` and `cmd.Stderr` to the output buffer, which implements `io.Writer` — each `Write()` call appends data under the lock and fires the notification channel (Section 6).
-3. Call `cmd.Start()` — if it fails, return error, no job created.
-4. Assign UUID, store job, return ID to client.
-5. A background goroutine calls `cmd.Wait()`, then marks the buffer as done with a final notification.
+1. Set `cmd.Stdout` and `cmd.Stderr` to the output buffer, which implements `io.Writer` — each `Write()` call appends data under the lock and fires the notification channel (Section 6).
+2. Call `cmd.Start()` — if it fails, return error, no job created.
+3. Assign UUID (`github.com/google/uuid`), store job, return ID to client.
+4. A background goroutine calls `cmd.Wait()`, then marks the buffer as done with a final notification.
 
 ### Stop
 
-1. Set `stopped_by_user = true` under lock before sending the signal — the background `Wait()` goroutine reads this flag when recording the final exit state, ensuring no race between stop and exit detection.
-2. Send SIGTERM to the process group (`-pgid`).
-3. Wait up to 5 seconds for exit.
-4. If still running, send SIGKILL to the process group.
+1. Set an internal `stopping` flag under lock — this is not exposed in the API but tells the `Wait()` goroutine to record `JOB_STATUS_STOPPED` instead of `JOB_STATUS_EXITED`.
+2. Call `cmd.Process.Kill()` — sends SIGKILL directly to the process.
+3. The background `Wait()` goroutine detects exit, checks the `stopping` flag, and records the appropriate status.
 
-The Stop RPC blocks until the process exits or the SIGKILL timeout elapses (~5s). Stop is idempotent during the stop sequence: subsequent calls join the existing grace period. Calling Stop on an already-exited job returns `FAILED_PRECONDITION`. SIGKILL on an already-exited process is a harmless no-op (the kernel returns ESRCH).
+Calling Stop on an already-terminated job returns `FAILED_PRECONDITION`. Sending SIGKILL to an already-exited process is a harmless no-op (the kernel returns ESRCH).
 
-This provides best-effort child process cleanup via process groups.
+_TODO: Graceful termination via SIGTERM with a configurable grace period before SIGKILL._
 
 _TODO (L5): Use cgroups for guaranteed cleanup of the full process tree and resource control._
 
 ### States
 
-Two states: **running** and **exited**. Exited jobs carry `exit_code` (from `ProcessState.ExitCode()` — Go returns -1 when killed by signal) and `stopped_by_user` (bool). The `stopped_by_user` flag is the reliable indicator of a Stop RPC — not the exit code.
+Three states: **running**, **exited**, and **stopped**. Exited and stopped jobs carry `exit_code` (from `ProcessState.ExitCode()` — Go returns -1 when killed by signal). The `JOB_STATUS_STOPPED` value is the reliable indicator that the job was terminated via the Stop RPC. `JOB_STATUS_EXITED` indicates the process terminated on its own (exit code 0 for success, non-zero for error).
 
 ## 8. CLI UX
 
+All flags have hardcoded defaults for the prototype: `--server-addr` defaults to `localhost:50051`, `--ca-cert` to `certs/ca.pem`, `--client-cert` to `certs/admin.pem`, `--client-key` to `certs/admin-key.pem`. The common case requires zero flags.
+
 ```bash
 # Start a job (everything after -- is the command + args)
+# Outputs bare job ID for piping
 $ jobctl start -- ls -la /tmp
-Job started: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+a1b2c3d4-e5f6-7890-abcd-ef1234567890
 
-# List all jobs
-$ jobctl list
-ID            STATUS
-a1b2c3d4      RUNNING
-f9e8d7c6      EXITED
+# Pipe start output directly into logs
+$ jobctl start -- sleep 60 | xargs jobctl logs
 
 # Check status
-$ jobctl status a1b2c3d4
+$ jobctl status a1b2c3d4-e5f6-7890-abcd-ef1234567890
 Status: RUNNING
 
 # Stream output (follows until job exits or Ctrl+C)
-$ jobctl logs a1b2c3d4
+$ jobctl logs a1b2c3d4-e5f6-7890-abcd-ef1234567890
 total 48
 drwxrwxrwt 12 root root 4096 Mar 20 10:00 .
 ...
 
 # Stream binary output to a file
-$ jobctl logs a1b2c3d4 > output.bin
+$ jobctl logs a1b2c3d4-e5f6-7890-abcd-ef1234567890 > output.bin
 
 # Stop a job
-$ jobctl stop a1b2c3d4
-Job stopped.
+$ jobctl stop a1b2c3d4-e5f6-7890-abcd-ef1234567890
 
-# All commands require TLS certs and server address
-$ jobctl --server-addr localhost:50051 \
-         --ca-cert certs/ca.pem \
-         --client-cert certs/admin.pem \
-         --client-key certs/admin-key.pem \
-         start -- sleep 60
+# Override defaults for non-standard setup
+$ jobctl --server-addr remote:50051 \
+         --client-cert certs/viewer.pem \
+         --client-key certs/viewer-key.pem \
+         status a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
-The CLI writes raw bytes directly to stdout, enabling piping to files or other tools — no encoding transformation is applied. Job IDs can be specified as a prefix for convenience; the CLI resolves prefix matches client-side via `ListJobs`, and ambiguous prefixes (matching multiple jobs) return an error.
-
-_TODO: Default cert paths and server address via environment variables or config file._
+The CLI writes raw bytes directly to stdout, enabling piping to files or other tools — no encoding transformation is applied. CLI output is machine-friendly: `start` prints only the job ID, `stop` produces no output on success (exit code 0).
