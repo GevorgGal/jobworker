@@ -1,25 +1,27 @@
 package worker
 
 import (
+	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
 )
 
-// waitForBufferDone drains the buffer's notification channel until the buffer
-// is marked done, with a timeout to prevent tests from hanging.
-func waitForBufferDone(t *testing.T, buf *OutputBuffer) {
+// waitForDone drains the reader until EOF, with a timeout to prevent tests
+// from hanging.
+func waitForDone(t *testing.T, reader *OutputReader) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	for {
-		_, done, ch := buf.ReadFrom(0)
-		if done {
+		_, err := reader.Read(ctx)
+		if err == io.EOF {
 			return
 		}
-		select {
-		case <-ch:
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for buffer done")
+		if err != nil {
+			t.Fatalf("waiting for done: %v", err)
 		}
 	}
 }
@@ -35,8 +37,8 @@ func TestJobManager_StartAndGetStatus(t *testing.T) {
 		t.Fatal("Start returned empty ID")
 	}
 
-	buf, _ := m.GetOutputBuffer(id)
-	waitForBufferDone(t, buf)
+	reader, _ := m.GetOutputReader(id)
+	waitForDone(t, reader)
 
 	status, exitCode, err := m.GetStatus(id)
 	if err != nil {
@@ -88,8 +90,8 @@ func TestJobManager_Stop(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	buf, _ := m.GetOutputBuffer(id)
-	waitForBufferDone(t, buf)
+	reader, _ := m.GetOutputReader(id)
+	waitForDone(t, reader)
 
 	status, _, err := m.GetStatus(id)
 	if err != nil {
@@ -118,7 +120,7 @@ func TestJobManager_GetStatusNotFound(t *testing.T) {
 	}
 }
 
-func TestJobManager_GetOutputBuffer(t *testing.T) {
+func TestJobManager_GetOutputReader(t *testing.T) {
 	m := NewJobManager()
 
 	id, err := m.Start("echo", []string{"hello"})
@@ -126,25 +128,37 @@ func TestJobManager_GetOutputBuffer(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	buf, err := m.GetOutputBuffer(id)
+	reader, err := m.GetOutputReader(id)
 	if err != nil {
-		t.Fatalf("GetOutputBuffer: %v", err)
+		t.Fatalf("GetOutputReader: %v", err)
 	}
 
-	waitForBufferDone(t, buf)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	data, _, _ := buf.ReadFrom(0)
-	if got := string(data); got != "hello\n" {
+	var collected []byte
+	for {
+		data, readErr := reader.Read(ctx)
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			t.Fatalf("Read: %v", readErr)
+		}
+		collected = append(collected, data...)
+	}
+
+	if got := string(collected); got != "hello\n" {
 		t.Fatalf("output = %q, want %q", got, "hello\n")
 	}
 }
 
-func TestJobManager_GetOutputBufferNotFound(t *testing.T) {
+func TestJobManager_GetOutputReaderNotFound(t *testing.T) {
 	m := NewJobManager()
 
-	_, err := m.GetOutputBuffer("nonexistent-id")
+	_, err := m.GetOutputReader("nonexistent-id")
 	if !errors.Is(err, ErrJobNotFound) {
-		t.Fatalf("GetOutputBuffer: got %v, want ErrJobNotFound", err)
+		t.Fatalf("GetOutputReader: got %v, want ErrJobNotFound", err)
 	}
 }
 
@@ -172,8 +186,8 @@ func TestJobManager_FullLifecycle(t *testing.T) {
 	}
 
 	// Wait and verify stopped.
-	buf, _ := m.GetOutputBuffer(id)
-	waitForBufferDone(t, buf)
+	reader, _ := m.GetOutputReader(id)
+	waitForDone(t, reader)
 
 	status, _, err = m.GetStatus(id)
 	if err != nil {
@@ -198,17 +212,15 @@ func TestJobManager_ConcurrentStarts(t *testing.T) {
 	errs := make([]error, n)
 
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+	for i := range n {
+		wg.Go(func() {
 			ids[i], errs[i] = m.Start("true", nil)
-		}(i)
+		})
 	}
 	wg.Wait()
 
 	seen := make(map[string]bool)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if errs[i] != nil {
 			t.Fatalf("Start %d: %v", i, errs[i])
 		}
@@ -224,7 +236,7 @@ func TestJobManager_ConcurrentStartAndStop(t *testing.T) {
 
 	const n = 5
 	ids := make([]string, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		id, err := m.Start("sleep", []string{"60"})
 		if err != nil {
 			t.Fatalf("Start %d: %v", i, err)
@@ -235,20 +247,18 @@ func TestJobManager_ConcurrentStartAndStop(t *testing.T) {
 	// Stop all concurrently.
 	var wg sync.WaitGroup
 	for _, id := range ids {
-		wg.Add(1)
-		go func(id string) {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := m.Stop(id); err != nil {
 				t.Errorf("Stop(%s): %v", id, err)
 			}
-		}(id)
+		})
 	}
 	wg.Wait()
 
 	// Verify all stopped.
 	for _, id := range ids {
-		buf, _ := m.GetOutputBuffer(id)
-		waitForBufferDone(t, buf)
+		reader, _ := m.GetOutputReader(id)
+		waitForDone(t, reader)
 
 		status, _, _ := m.GetStatus(id)
 		if status != JobStatusStopped {

@@ -149,15 +149,13 @@ func TestJob_ConcurrentStop(t *testing.T) {
 		t.Fatalf("startJob: %v", err)
 	}
 
-	var wg sync.WaitGroup
 	results := make(chan error, 2)
+	var wg sync.WaitGroup
 
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 2 {
+		wg.Go(func() {
 			results <- job.Stop()
-		}()
+		})
 	}
 	wg.Wait()
 	close(results)
@@ -207,7 +205,7 @@ func TestJob_CapturesStdout(t *testing.T) {
 
 	<-job.Done()
 
-	data, done, _ := job.Output().ReadFrom(0)
+	data, done, _ := job.Output().readFrom(0)
 	if !done {
 		t.Fatal("expected buffer done after job exit")
 	}
@@ -225,7 +223,7 @@ func TestJob_CapturesStderr(t *testing.T) {
 
 	<-job.Done()
 
-	data, done, _ := job.Output().ReadFrom(0)
+	data, done, _ := job.Output().readFrom(0)
 	if !done {
 		t.Fatal("expected buffer done after job exit")
 	}
@@ -243,7 +241,7 @@ func TestJob_BufferMarkedDoneOnExit(t *testing.T) {
 
 	<-job.Done()
 
-	_, done, _ := job.Output().ReadFrom(0)
+	_, done, _ := job.Output().readFrom(0)
 	if !done {
 		t.Fatal("expected output buffer done after job exit")
 	}

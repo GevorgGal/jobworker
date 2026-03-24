@@ -1,11 +1,18 @@
 package worker
 
 import (
+	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
 )
+
+// ---------------------------------------------------------------------------
+// Low-level buffer tests — exercise readFrom directly to verify the
+// internal notification and data mechanics.
+// ---------------------------------------------------------------------------
 
 func TestOutputBuffer_WriteAndRead(t *testing.T) {
 	tests := []struct {
@@ -72,14 +79,14 @@ func TestOutputBuffer_WriteAndRead(t *testing.T) {
 				}
 			}
 
-			data, _, _ := buf.ReadFrom(tt.offset)
+			data, _, _ := buf.readFrom(tt.offset)
 
 			if tt.want == "" && data != nil {
-				t.Fatalf("ReadFrom(%d) = %q, want nil", tt.offset, data)
+				t.Fatalf("readFrom(%d) = %q, want nil", tt.offset, data)
 			}
 
 			if got := string(data); got != tt.want {
-				t.Fatalf("ReadFrom(%d) = %q, want %q", tt.offset, got, tt.want)
+				t.Fatalf("readFrom(%d) = %q, want %q", tt.offset, got, tt.want)
 			}
 		})
 	}
@@ -89,24 +96,12 @@ func TestOutputBuffer_ReadFromReturnsCopy(t *testing.T) {
 	buf := NewOutputBuffer()
 	_, _ = buf.Write([]byte("hello"))
 
-	data, _, _ := buf.ReadFrom(0)
+	data, _, _ := buf.readFrom(0)
 	data[0] = 'X' // mutate returned slice
 
-	original, _, _ := buf.ReadFrom(0)
+	original, _, _ := buf.readFrom(0)
 	if string(original) != "hello" {
 		t.Fatalf("internal data was mutated: got %q, want %q", original, "hello")
-	}
-}
-
-func TestOutputBuffer_Len(t *testing.T) {
-	buf := NewOutputBuffer()
-	if buf.Len() != 0 {
-		t.Fatalf("empty buffer Len() = %d, want 0", buf.Len())
-	}
-
-	_, _ = buf.Write([]byte("hello"))
-	if buf.Len() != 5 {
-		t.Fatalf("after write Len() = %d, want 5", buf.Len())
 	}
 }
 
@@ -129,14 +124,14 @@ func TestOutputBuffer_MarkDoneIdempotent(t *testing.T) {
 func TestOutputBuffer_DoneFlag(t *testing.T) {
 	buf := NewOutputBuffer()
 
-	_, done, _ := buf.ReadFrom(0)
+	_, done, _ := buf.readFrom(0)
 	if done {
 		t.Fatal("expected done=false before MarkDone")
 	}
 
 	buf.MarkDone()
 
-	_, done, _ = buf.ReadFrom(0)
+	_, done, _ = buf.readFrom(0)
 	if !done {
 		t.Fatal("expected done=true after MarkDone")
 	}
@@ -144,7 +139,7 @@ func TestOutputBuffer_DoneFlag(t *testing.T) {
 
 func TestOutputBuffer_NotifyOnWrite(t *testing.T) {
 	buf := NewOutputBuffer()
-	_, _, ch := buf.ReadFrom(0)
+	_, _, ch := buf.readFrom(0)
 
 	_, _ = buf.Write([]byte("data"))
 
@@ -158,7 +153,7 @@ func TestOutputBuffer_NotifyOnWrite(t *testing.T) {
 
 func TestOutputBuffer_NotifyOnMarkDone(t *testing.T) {
 	buf := NewOutputBuffer()
-	_, _, ch := buf.ReadFrom(0)
+	_, _, ch := buf.readFrom(0)
 
 	buf.MarkDone()
 
@@ -172,10 +167,10 @@ func TestOutputBuffer_NotifyOnMarkDone(t *testing.T) {
 
 func TestOutputBuffer_NotifyChannelReplaced(t *testing.T) {
 	buf := NewOutputBuffer()
-	_, _, ch1 := buf.ReadFrom(0)
+	_, _, ch1 := buf.readFrom(0)
 
 	_, _ = buf.Write([]byte("data"))
-	_, _, ch2 := buf.ReadFrom(0)
+	_, _, ch2 := buf.readFrom(0)
 
 	// Old channel should be closed, new one should be open.
 	select {
@@ -190,125 +185,13 @@ func TestOutputBuffer_NotifyChannelReplaced(t *testing.T) {
 	}
 }
 
-func TestOutputBuffer_ReaderLoop(t *testing.T) {
-	buf := NewOutputBuffer()
-
-	go func() {
-		_, _ = buf.Write([]byte("chunk1"))
-		_, _ = buf.Write([]byte("chunk2"))
-		_, _ = buf.Write([]byte("chunk3"))
-		buf.MarkDone()
-	}()
-
-	var collected []byte
-	offset := 0
-	for {
-		data, done, ch := buf.ReadFrom(offset)
-		if len(data) > 0 {
-			collected = append(collected, data...)
-			offset += len(data)
-		}
-		if done && len(data) == 0 {
-			break
-		}
-		if len(data) == 0 {
-			select {
-			case <-ch:
-			case <-time.After(5 * time.Second):
-				t.Fatal("timed out waiting for notification")
-			}
-		}
-	}
-
-	if got := string(collected); got != "chunk1chunk2chunk3" {
-		t.Fatalf("collected = %q, want %q", got, "chunk1chunk2chunk3")
-	}
-}
-
-func TestOutputBuffer_ConcurrentReaders(t *testing.T) {
-	buf := NewOutputBuffer()
-	want := "abcdefghij"
-
-	go func() {
-		for _, b := range []byte(want) {
-			_, _ = buf.Write([]byte{b})
-			time.Sleep(time.Millisecond)
-		}
-		buf.MarkDone()
-	}()
-
-	const numReaders = 5
-	var wg sync.WaitGroup
-
-	for i := 0; i < numReaders; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			var collected []byte
-			offset := 0
-
-			for {
-				data, done, ch := buf.ReadFrom(offset)
-				if len(data) > 0 {
-					collected = append(collected, data...)
-					offset += len(data)
-				}
-				if done && len(data) == 0 {
-					break
-				}
-				if len(data) == 0 {
-					select {
-					case <-ch:
-					case <-time.After(5 * time.Second):
-						t.Errorf("reader timed out at offset %d", offset)
-						return
-					}
-				}
-			}
-
-			if got := string(collected); got != want {
-				t.Errorf("reader got %q, want %q", got, want)
-			}
-		}()
-	}
-
-	wg.Wait()
-}
-
-func TestOutputBuffer_ReadFromCompletedBuffer(t *testing.T) {
-	buf := NewOutputBuffer()
-	_, _ = buf.Write([]byte("complete data"))
-	buf.MarkDone()
-
-	// Reader arrives after buffer is done — should get all data.
-	data, done, _ := buf.ReadFrom(0)
-	if !done {
-		t.Fatal("expected done=true")
-	}
-
-	if string(data) != "complete data" {
-		t.Fatalf("got %q, want %q", string(data), "complete data")
-	}
-
-	// Second read from end — EOF condition.
-	data, done, _ = buf.ReadFrom(len("complete data"))
-	if !done {
-		t.Fatal("expected done=true at EOF")
-	}
-
-	if len(data) != 0 {
-		t.Fatalf("expected empty data at EOF, got %q", string(data))
-	}
-}
-
 func TestOutputBuffer_BinaryData(t *testing.T) {
 	buf := NewOutputBuffer()
 
 	input := []byte{0x00, 0xFF, 0x01, 0xFE, 0x00}
 	_, _ = buf.Write(input)
 
-	data, _, _ := buf.ReadFrom(0)
+	data, _, _ := buf.readFrom(0)
 	if len(data) != len(input) {
 		t.Fatalf("expected %d bytes, got %d", len(input), len(data))
 	}
@@ -317,5 +200,120 @@ func TestOutputBuffer_BinaryData(t *testing.T) {
 		if data[i] != input[i] {
 			t.Fatalf("byte %d: expected 0x%02x, got 0x%02x", i, input[i], data[i])
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OutputReader tests — exercise the public consumer API.
+// ---------------------------------------------------------------------------
+
+func TestOutputReader_ReaderLoop(t *testing.T) {
+	buf := NewOutputBuffer()
+	reader := buf.NewReader()
+
+	go func() {
+		_, _ = buf.Write([]byte("chunk1"))
+		_, _ = buf.Write([]byte("chunk2"))
+		_, _ = buf.Write([]byte("chunk3"))
+		buf.MarkDone()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var collected []byte
+	for {
+		data, err := reader.Read(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		collected = append(collected, data...)
+	}
+
+	if got := string(collected); got != "chunk1chunk2chunk3" {
+		t.Fatalf("collected = %q, want %q", got, "chunk1chunk2chunk3")
+	}
+}
+
+func TestOutputReader_ConcurrentReaders(t *testing.T) {
+	buf := NewOutputBuffer()
+	want := "abcdefghij"
+
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		for _, b := range []byte(want) {
+			_, _ = buf.Write([]byte{b})
+			time.Sleep(time.Millisecond)
+		}
+		buf.MarkDone()
+	})
+
+	const numReaders = 5
+	for range numReaders {
+		wg.Go(func() {
+			reader := buf.NewReader()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			var collected []byte
+			for {
+				data, err := reader.Read(ctx)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Errorf("reader error: %v", err)
+					return
+				}
+				collected = append(collected, data...)
+			}
+
+			if got := string(collected); got != want {
+				t.Errorf("reader got %q, want %q", got, want)
+			}
+		})
+	}
+
+	wg.Wait()
+}
+
+func TestOutputReader_ReadFromCompletedBuffer(t *testing.T) {
+	buf := NewOutputBuffer()
+	_, _ = buf.Write([]byte("complete data"))
+	buf.MarkDone()
+
+	// Reader arrives after buffer is done — should get all data then EOF.
+	reader := buf.NewReader()
+	ctx := context.Background()
+
+	data, err := reader.Read(ctx)
+	if err != nil {
+		t.Fatalf("first Read: %v", err)
+	}
+	if string(data) != "complete data" {
+		t.Fatalf("got %q, want %q", string(data), "complete data")
+	}
+
+	// Second read — EOF.
+	_, err = reader.Read(ctx)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("second Read: got %v, want io.EOF", err)
+	}
+}
+
+func TestOutputReader_ContextCancellation(t *testing.T) {
+	buf := NewOutputBuffer()
+	reader := buf.NewReader()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := reader.Read(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
 	}
 }
