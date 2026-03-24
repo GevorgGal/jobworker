@@ -45,6 +45,9 @@ func (b *OutputBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// TODO: Add maxLen parameter to avoid copying the entire tail on each call.
+// The gRPC streaming layer chunks at 32KB and could pass that limit here.
+//
 // ReadFrom returns buffered data from offset, completion status, and a
 // notification channel. The caller must provide a non-negative offset;
 // negative values are clamped to 0.

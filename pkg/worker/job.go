@@ -116,7 +116,7 @@ func (j *Job) Output() *OutputBuffer {
 	return j.output
 }
 
-// Done returns a channel that is closed when the job has fully terminated.
+// Done returns a channel that is closed after the job has fully terminated.
 func (j *Job) Done() <-chan struct{} {
 	return j.done
 }
