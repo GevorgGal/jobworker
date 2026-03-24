@@ -69,8 +69,9 @@ func (m *JobManager) GetStatus(id string) (JobStatus, int, error) {
 	return status, exitCode, nil
 }
 
-// GetOutputBuffer returns the output buffer for the given job ID.
-func (m *JobManager) GetOutputBuffer(id string) (*OutputBuffer, error) {
+// GetOutputReader returns a new OutputReader for the given job ID, starting
+// from the beginning of the output buffer.
+func (m *JobManager) GetOutputReader(id string) (*OutputReader, error) {
 	m.mu.RLock()
 	job, ok := m.jobs[id]
 	m.mu.RUnlock()
@@ -79,5 +80,5 @@ func (m *JobManager) GetOutputBuffer(id string) (*OutputBuffer, error) {
 		return nil, ErrJobNotFound
 	}
 
-	return job.Output(), nil
+	return job.Output().NewReader(), nil
 }

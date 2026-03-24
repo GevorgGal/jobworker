@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"context"
 	"errors"
+	"io"
 	"sync"
 )
 
@@ -45,13 +47,13 @@ func (b *OutputBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TODO: Add maxLen parameter to avoid copying the entire tail on each call.
-// The gRPC streaming layer chunks at 32KB and could pass that limit here.
+// readFrom returns buffered data from offset, completion status, and a
+// notification channel. Callers should use OutputReader instead of calling
+// this directly. Negative offsets are clamped to 0.
 //
-// ReadFrom returns buffered data from offset, completion status, and a
-// notification channel. The caller must provide a non-negative offset;
-// negative values are clamped to 0.
-func (b *OutputBuffer) ReadFrom(offset int) (data []byte, done bool, notify <-chan struct{}) {
+// TODO: Add maxLen parameter to limit the copy size per call. This would
+// reduce memory pressure when a new reader replays a large accumulated buffer.
+func (b *OutputBuffer) readFrom(offset int) (data []byte, done bool, notify <-chan struct{}) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -81,10 +83,36 @@ func (b *OutputBuffer) MarkDone() {
 	close(b.notifyCh)
 }
 
-// Len returns the current size of the buffered data in bytes.
-func (b *OutputBuffer) Len() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+// NewReader creates an OutputReader that streams this buffer's contents
+// from the beginning.
+func (b *OutputBuffer) NewReader() *OutputReader {
+	return &OutputReader{buf: b}
+}
 
-	return len(b.data)
+// OutputReader provides a simple, safe interface for consuming output from
+// an OutputBuffer. It tracks read position internally and blocks efficiently
+// until new data arrives or the context is cancelled.
+type OutputReader struct {
+	buf    *OutputBuffer
+	offset int
+}
+
+// Read returns the next chunk of output, blocking until data is available
+// or ctx is cancelled. Returns io.EOF when the buffer is done and fully read.
+func (r *OutputReader) Read(ctx context.Context) ([]byte, error) {
+	for {
+		data, done, ch := r.buf.readFrom(r.offset)
+		if len(data) > 0 {
+			r.offset += len(data)
+			return data, nil
+		}
+		if done {
+			return nil, io.EOF
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
