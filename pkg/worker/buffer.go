@@ -11,6 +11,10 @@ import (
 // marked done.
 var ErrBufferClosed = errors.New("buffer is closed")
 
+// maxReadSize is the maximum number of bytes returned by a single readFrom
+// call. This bounds memory allocation per read.
+const maxReadSize = 32 * 1024
+
 // OutputBuffer is an append-only, concurrency-safe byte buffer that captures
 // process output (combined stdout/stderr). It uses a close-and-replace channel
 // pattern to notify multiple concurrent readers without polling.
@@ -50,9 +54,6 @@ func (b *OutputBuffer) Write(p []byte) (int, error) {
 // readFrom returns buffered data from offset, completion status, and a
 // notification channel. Callers should use OutputReader instead of calling
 // this directly. Negative offsets are clamped to 0.
-//
-// TODO: Add maxLen parameter to limit the copy size per call. This would
-// reduce memory pressure when a new reader replays a large accumulated buffer.
 func (b *OutputBuffer) readFrom(offset int) (data []byte, done bool, notify <-chan struct{}) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -62,8 +63,12 @@ func (b *OutputBuffer) readFrom(offset int) (data []byte, done bool, notify <-ch
 	}
 
 	if offset < len(b.data) {
-		data = make([]byte, len(b.data)-offset)
-		copy(data, b.data[offset:])
+		end := len(b.data)
+		if end-offset > maxReadSize {
+			end = offset + maxReadSize
+		}
+		data = make([]byte, end-offset)
+		copy(data, b.data[offset:end])
 	}
 
 	return data, b.done, b.notifyCh

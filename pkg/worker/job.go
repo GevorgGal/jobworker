@@ -80,7 +80,7 @@ func (j *Job) Stop() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	if j.status != JobStatusRunning {
+	if j.stopping || j.status != JobStatusRunning {
 		return ErrAlreadyStopped
 	}
 
