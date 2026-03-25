@@ -13,7 +13,7 @@ import (
 // from hanging.
 func waitForDone(t *testing.T, reader *OutputReader) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	for {
 		_, err := reader.Read(ctx)
@@ -133,7 +133,7 @@ func TestJobManager_GetOutputReader(t *testing.T) {
 		t.Fatalf("GetOutputReader: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	var collected []byte

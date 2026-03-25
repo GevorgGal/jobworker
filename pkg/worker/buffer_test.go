@@ -218,7 +218,7 @@ func TestOutputReader_ReaderLoop(t *testing.T) {
 		buf.MarkDone()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	var collected []byte
@@ -256,7 +256,7 @@ func TestOutputReader_ConcurrentReaders(t *testing.T) {
 	for range numReaders {
 		wg.Go(func() {
 			reader := buf.NewReader()
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 
 			var collected []byte
@@ -288,7 +288,7 @@ func TestOutputReader_ReadFromCompletedBuffer(t *testing.T) {
 
 	// Reader arrives after buffer is done — should get all data then EOF.
 	reader := buf.NewReader()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	data, err := reader.Read(ctx)
 	if err != nil {
@@ -309,11 +309,34 @@ func TestOutputReader_ContextCancellation(t *testing.T) {
 	buf := NewOutputBuffer()
 	reader := buf.NewReader()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	_, err := reader.Read(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+func TestOutputBuffer_ReadFromCapsAtMaxReadSize(t *testing.T) {
+	buf := NewOutputBuffer()
+
+	// Write more than maxReadSize.
+	large := make([]byte, maxReadSize+1024)
+	for i := range large {
+		large[i] = byte(i % 256)
+	}
+	_, _ = buf.Write(large)
+
+	// Single readFrom should return at most maxReadSize bytes.
+	data, _, _ := buf.readFrom(0)
+	if len(data) != maxReadSize {
+		t.Fatalf("readFrom returned %d bytes, want %d", len(data), maxReadSize)
+	}
+
+	// Second read from the new offset should return the remainder.
+	data2, _, _ := buf.readFrom(maxReadSize)
+	if len(data2) != 1024 {
+		t.Fatalf("second readFrom returned %d bytes, want %d", len(data2), 1024)
 	}
 }
