@@ -11,11 +11,14 @@ proto-gen:
 		$(PROTO_DIR)/jobworker.proto
 
 certs:
-	cd certs && bash gen.sh
+	@if [ -f certs/ca.pem ]; then \
+		echo "Certificates already exist. Remove certs/*.pem to regenerate."; \
+	else \
+		cd certs && bash gen.sh; \
+	fi
 
 test:
 	go test -race ./...
 
-# TODO: Add .golangci.yml for reproducible lint results across machines.
 lint:
 	golangci-lint run ./...
