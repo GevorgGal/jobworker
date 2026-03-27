@@ -1,0 +1,123 @@
+package worker
+
+import (
+	"context"
+	"errors"
+	"io"
+	"sync"
+)
+
+// ErrBufferClosed is returned when Write is called on a buffer that has been
+// marked done.
+var ErrBufferClosed = errors.New("buffer is closed")
+
+// maxReadSize is the maximum number of bytes returned by a single readFrom
+// call. This bounds memory allocation per read.
+const maxReadSize = 32 * 1024
+
+// OutputBuffer is an append-only, concurrency-safe byte buffer that captures
+// process output (combined stdout/stderr). It uses a close-and-replace channel
+// pattern to notify multiple concurrent readers without polling.
+type OutputBuffer struct {
+	mu       sync.Mutex
+	data     []byte
+	done     bool
+	notifyCh chan struct{}
+}
+
+// NewOutputBuffer creates a new OutputBuffer ready for writing and reading.
+func NewOutputBuffer() *OutputBuffer {
+	return &OutputBuffer{
+		notifyCh: make(chan struct{}),
+	}
+}
+
+// Write appends p to the buffer and wakes all blocked readers.
+// Implements io.Writer. Returns ErrBufferClosed after MarkDone.
+func (b *OutputBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.done {
+		return 0, ErrBufferClosed
+	}
+
+	b.data = append(b.data, p...)
+
+	// Close-and-replace: wake all waiting readers, prepare for next wait.
+	close(b.notifyCh)
+	b.notifyCh = make(chan struct{})
+
+	return len(p), nil
+}
+
+// readFrom returns buffered data from offset, completion status, and a
+// notification channel. Callers should use OutputReader instead of calling
+// this directly. Negative offsets are clamped to 0.
+func (b *OutputBuffer) readFrom(offset int) (data []byte, done bool, notify <-chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if offset < 0 {
+		offset = 0
+	}
+
+	if offset < len(b.data) {
+		end := len(b.data)
+		if end-offset > maxReadSize {
+			end = offset + maxReadSize
+		}
+		data = make([]byte, end-offset)
+		copy(data, b.data[offset:end])
+	}
+
+	return data, b.done, b.notifyCh
+}
+
+// MarkDone signals that no more data will be written and wakes all waiting
+// readers. Idempotent.
+func (b *OutputBuffer) MarkDone() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.done {
+		return
+	}
+
+	b.done = true
+	close(b.notifyCh)
+}
+
+// NewReader creates an OutputReader that streams this buffer's contents
+// from the beginning.
+func (b *OutputBuffer) NewReader() *OutputReader {
+	return &OutputReader{buf: b}
+}
+
+// OutputReader provides a simple, safe interface for consuming output from
+// an OutputBuffer. It tracks read position internally and blocks efficiently
+// until new data arrives or the context is cancelled.
+type OutputReader struct {
+	buf    *OutputBuffer
+	offset int
+}
+
+// Read returns the next chunk of output, blocking until data is available
+// or ctx is cancelled. Returns io.EOF when the buffer is done and fully read.
+func (r *OutputReader) Read(ctx context.Context) ([]byte, error) {
+	for {
+		data, done, ch := r.buf.readFrom(r.offset)
+		if len(data) > 0 {
+			r.offset += len(data)
+			return data, nil
+		}
+		if done {
+			return nil, io.EOF
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
