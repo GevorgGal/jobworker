@@ -36,7 +36,7 @@ jobworker/
   internal/server/   — gRPC service handler
   internal/client/   — gRPC client wrapper
   pkg/worker/        — library (no gRPC dependency)
-  pkg/auth/          — interceptor + role mapping
+  internal/auth/     — interceptor + role mapping
   proto/             — protobuf definitions
   certs/             — pre-generated certificates
 ```
