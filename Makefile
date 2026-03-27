@@ -2,6 +2,7 @@ PROTO_DIR := proto/jobworker/v1
 
 .PHONY: proto-gen certs test lint
 
+# Generated with protoc v23.0, protoc-gen-go v1.36.11, protoc-gen-go-grpc v1.6.1
 # Regenerate after editing jobworker.proto. Commit the generated files.
 proto-gen:
 	protoc \
@@ -15,5 +16,6 @@ certs:
 test:
 	go test -race ./...
 
+# TODO: Add .golangci.yml for reproducible lint results across machines.
 lint:
 	golangci-lint run ./...

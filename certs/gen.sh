@@ -19,6 +19,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+rm -f *.pem
 
 CA_DAYS=3650
 LEAF_DAYS=365
