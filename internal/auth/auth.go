@@ -105,9 +105,9 @@ func authorize(ctx context.Context, method string) error {
 	}
 
 	// Non-admin roles can only access explicitly allowed methods.
-	if r != roleAdmin && !viewerAllowed[method] {
-		return errPermissionDenied
+	if r == roleAdmin || viewerAllowed[method] {
+		return nil
 	}
 
-	return nil
+	return errPermissionDenied
 }
