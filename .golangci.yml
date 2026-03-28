@@ -1,0 +1,7 @@
+# Minimal config to ensure consistent lint results across machines.
+# golangci-lint walks parent directories for config files; having one
+# here prevents external configs from affecting results.
+version: '2'
+
+run:
+  timeout: 5m

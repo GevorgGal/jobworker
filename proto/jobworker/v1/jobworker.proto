@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package jobworker.v1;
+
+option go_package = "github.com/GevorgGal/jobworker/proto/jobworker/v1;jobworkerv1";
+
+// JobWorker manages the lifecycle of arbitrary Linux processes.
+service JobWorker {
+  // Start launches a new process and returns its job ID.
+  rpc Start(StartRequest) returns (StartResponse);
+
+  // Stop terminates a running job by sending SIGKILL.
+  rpc Stop(StopRequest) returns (StopResponse);
+
+  // GetStatus returns the current state and exit code of a job.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // StreamOutput streams the job's combined stdout/stderr from the beginning.
+  // The stream completes when the job exits and all output has been delivered.
+  rpc StreamOutput(StreamOutputRequest) returns (stream StreamOutputResponse);
+}
+
+message StartRequest {
+  string command = 1;
+  repeated string args = 2;
+}
+
+message StartResponse {
+  string job_id = 1;
+}
+
+message StopRequest {
+  string job_id = 1;
+}
+
+message StopResponse {}
+
+message GetStatusRequest {
+  string job_id = 1;
+}
+
+message GetStatusResponse {
+  string job_id = 1;
+  JobStatus status = 2;
+  int32 exit_code = 3; // Meaningful when status is EXITED or STOPPED
+}
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_RUNNING = 1;
+  JOB_STATUS_EXITED = 2;
+  JOB_STATUS_STOPPED = 3;
+}
+
+message StreamOutputRequest {
+  string job_id = 1;
+}
+
+message StreamOutputResponse {
+  bytes data = 1;
+}
