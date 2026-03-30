@@ -7,13 +7,12 @@ import (
 	"crypto/x509/pkix"
 	"testing"
 
+	pb "github.com/GevorgGal/jobworker/proto/jobworker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
-
-	pb "github.com/GevorgGal/jobworker/proto/jobworker/v1"
 )
 
 // peerContext returns a context carrying a peer with a verified client
@@ -32,38 +31,21 @@ func peerContext(cn string) context.Context {
 }
 
 // ---------------------------------------------------------------------------
-// authorize — covers the full CN × method matrix and all error paths.
+// authenticate — TLS identity extraction and CN→role mapping.
 // ---------------------------------------------------------------------------
 
-func TestAuthorize(t *testing.T) {
+func TestAuthenticate(t *testing.T) {
 	tests := []struct {
-		name   string
-		ctx    context.Context
-		method string
-		want   codes.Code
+		name     string
+		ctx      context.Context
+		wantRole role
+		wantCode codes.Code
 	}{
-		// Admin — allowed on everything.
-		{"admin start", peerContext("admin"), pb.JobWorker_Start_FullMethodName, codes.OK},
-		{"admin stop", peerContext("admin"), pb.JobWorker_Stop_FullMethodName, codes.OK},
-		{"admin get status", peerContext("admin"), pb.JobWorker_GetStatus_FullMethodName, codes.OK},
-		{"admin stream output", peerContext("admin"), pb.JobWorker_StreamOutput_FullMethodName, codes.OK},
-
-		// Viewer — read-only.
-		{"viewer get status", peerContext("viewer"), pb.JobWorker_GetStatus_FullMethodName, codes.OK},
-		{"viewer stream output", peerContext("viewer"), pb.JobWorker_StreamOutput_FullMethodName, codes.OK},
-		{"viewer start denied", peerContext("viewer"), pb.JobWorker_Start_FullMethodName, codes.PermissionDenied},
-		{"viewer stop denied", peerContext("viewer"), pb.JobWorker_Stop_FullMethodName, codes.PermissionDenied},
-
-		// Default-deny: unknown methods require admin.
-		{"admin unknown method allowed", peerContext("admin"), "/jobworker.v1.JobWorker/UnknownRPC", codes.OK},
-		{"viewer unknown method denied", peerContext("viewer"), "/jobworker.v1.JobWorker/UnknownRPC", codes.PermissionDenied},
-
-		// Unknown CN.
-		{"unknown CN", peerContext("intruder"), pb.JobWorker_GetStatus_FullMethodName, codes.PermissionDenied},
-
-		// Missing or malformed peer info.
-		{"no peer", context.Background(), pb.JobWorker_GetStatus_FullMethodName, codes.PermissionDenied},
-		{"no TLS info", peer.NewContext(context.Background(), &peer.Peer{}), pb.JobWorker_GetStatus_FullMethodName, codes.PermissionDenied},
+		{"admin CN", peerContext("admin"), roleAdmin, codes.OK},
+		{"viewer CN", peerContext("viewer"), roleViewer, codes.OK},
+		{"unknown CN", peerContext("intruder"), roleUnknown, codes.PermissionDenied},
+		{"no peer", context.Background(), roleUnknown, codes.PermissionDenied},
+		{"no TLS info", peer.NewContext(context.Background(), &peer.Peer{}), roleUnknown, codes.PermissionDenied},
 		{
 			"no verified chains",
 			peer.NewContext(context.Background(), &peer.Peer{
@@ -71,14 +53,60 @@ func TestAuthorize(t *testing.T) {
 					State: tls.ConnectionState{VerifiedChains: nil},
 				},
 			}),
-			pb.JobWorker_GetStatus_FullMethodName,
-			codes.PermissionDenied,
+			roleUnknown, codes.PermissionDenied,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := authorize(tt.ctx, tt.method)
+			r, err := authenticate(tt.ctx)
+			if tt.wantCode == codes.OK {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if r != tt.wantRole {
+					t.Fatalf("role = %v, want %v", r, tt.wantRole)
+				}
+			} else {
+				if status.Code(err) != tt.wantCode {
+					t.Fatalf("error code = %v, want %v", status.Code(err), tt.wantCode)
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// authorize — role × method permission checks. No TLS context needed.
+// ---------------------------------------------------------------------------
+
+func TestAuthorize(t *testing.T) {
+	tests := []struct {
+		name   string
+		r      role
+		method string
+		want   codes.Code
+	}{
+		// Admin — allowed on everything.
+		{"admin start", roleAdmin, pb.JobWorker_Start_FullMethodName, codes.OK},
+		{"admin stop", roleAdmin, pb.JobWorker_Stop_FullMethodName, codes.OK},
+		{"admin get status", roleAdmin, pb.JobWorker_GetStatus_FullMethodName, codes.OK},
+		{"admin stream output", roleAdmin, pb.JobWorker_StreamOutput_FullMethodName, codes.OK},
+
+		// Viewer — read-only.
+		{"viewer get status", roleViewer, pb.JobWorker_GetStatus_FullMethodName, codes.OK},
+		{"viewer stream output", roleViewer, pb.JobWorker_StreamOutput_FullMethodName, codes.OK},
+		{"viewer start denied", roleViewer, pb.JobWorker_Start_FullMethodName, codes.PermissionDenied},
+		{"viewer stop denied", roleViewer, pb.JobWorker_Stop_FullMethodName, codes.PermissionDenied},
+
+		// Default-deny: unknown methods require admin.
+		{"admin unknown method allowed", roleAdmin, "/jobworker.v1.JobWorker/UnknownRPC", codes.OK},
+		{"viewer unknown method denied", roleViewer, "/jobworker.v1.JobWorker/UnknownRPC", codes.PermissionDenied},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := authorize(tt.r, tt.method)
 			got := codes.OK
 			if err != nil {
 				got = status.Code(err)
@@ -91,9 +119,8 @@ func TestAuthorize(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Interceptor wiring — verify the interceptors call authorize and gate
-// the handler. One allow + one deny case each is sufficient; the full
-// matrix is covered by TestAuthorize above.
+// Interceptor wiring — verify the interceptors call authenticate+authorize
+// and gate the handler. One allow + one deny case each is sufficient.
 // ---------------------------------------------------------------------------
 
 func TestUnaryInterceptor(t *testing.T) {

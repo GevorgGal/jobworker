@@ -5,21 +5,21 @@ package auth
 import (
 	"context"
 
+	pb "github.com/GevorgGal/jobworker/proto/jobworker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
-
-	pb "github.com/GevorgGal/jobworker/proto/jobworker/v1"
 )
 
 // role represents an authorization level derived from a client certificate CN.
 type role int
 
 const (
-	roleAdmin  role = iota // Start, Stop, GetStatus, StreamOutput
-	roleViewer             // GetStatus, StreamOutput
+	roleUnknown role = iota // zero value; never mapped to a CN
+	roleAdmin               // Start, Stop, GetStatus, StreamOutput
+	roleViewer              // GetStatus, StreamOutput
 )
 
 // cnToRole maps client certificate Common Names to roles.
@@ -37,7 +37,9 @@ var viewerAllowed = map[string]bool{
 	pb.JobWorker_StreamOutput_FullMethodName: true,
 }
 
-// errPermissionDenied is a generic error returned for all authorization failures.
+// errPermissionDenied is a single, generic error returned for all authorization
+// failures. Using one message avoids leaking whether the failure was due to
+// missing TLS, unknown CN, or insufficient role.
 var errPermissionDenied = status.Error(codes.PermissionDenied, "permission denied")
 
 // UnaryInterceptor returns a grpc.UnaryServerInterceptor that enforces
@@ -49,10 +51,13 @@ func UnaryInterceptor() grpc.UnaryServerInterceptor {
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (any, error) {
-		if err := authorize(ctx, info.FullMethod); err != nil {
+		r, err := authenticate(ctx)
+		if err != nil {
 			return nil, err
 		}
-
+		if err := authorize(r, info.FullMethod); err != nil {
+			return nil, err
+		}
 		return handler(ctx, req)
 	}
 }
@@ -66,33 +71,37 @@ func StreamInterceptor() grpc.StreamServerInterceptor {
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) error {
-		if err := authorize(ss.Context(), info.FullMethod); err != nil {
+		r, err := authenticate(ss.Context())
+		if err != nil {
 			return err
 		}
-
+		if err := authorize(r, info.FullMethod); err != nil {
+			return err
+		}
 		return handler(srv, ss)
 	}
 }
 
-// authorize checks whether the peer's client certificate CN grants access
-// to the given gRPC method. Returns a gRPC status error on failure.
-func authorize(ctx context.Context, method string) error {
+// authenticate extracts the client's role from the peer's TLS certificate.
+// Returns a gRPC status error if the peer is missing, has no TLS info,
+// or presents an unknown CN.
+func authenticate(ctx context.Context) (role, error) {
 	// Extract peer from gRPC context.
 	p, ok := peer.FromContext(ctx)
 	if !ok {
-		return errPermissionDenied
+		return 0, errPermissionDenied
 	}
 
 	// Verify the peer connected over TLS.
 	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
 	if !ok {
-		return errPermissionDenied
+		return 0, errPermissionDenied
 	}
 
 	// Ensure the client certificate was verified against our CA.
 	chains := tlsInfo.State.VerifiedChains
 	if len(chains) == 0 || len(chains[0]) == 0 {
-		return errPermissionDenied
+		return 0, errPermissionDenied
 	}
 
 	// The leaf certificate's CN determines identity.
@@ -101,9 +110,14 @@ func authorize(ctx context.Context, method string) error {
 	// Map CN to a known role.
 	r, known := cnToRole[cn]
 	if !known {
-		return errPermissionDenied
+		return 0, errPermissionDenied
 	}
 
+	return r, nil
+}
+
+// authorize checks whether the given role is allowed to call the method.
+func authorize(r role, method string) error {
 	// Non-admin roles can only access explicitly allowed methods.
 	if r == roleAdmin || viewerAllowed[method] {
 		return nil
