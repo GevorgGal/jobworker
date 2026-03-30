@@ -89,19 +89,19 @@ func authenticate(ctx context.Context) (role, error) {
 	// Extract peer from gRPC context.
 	p, ok := peer.FromContext(ctx)
 	if !ok {
-		return 0, errPermissionDenied
+		return roleUnknown, errPermissionDenied
 	}
 
 	// Verify the peer connected over TLS.
 	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
 	if !ok {
-		return 0, errPermissionDenied
+		return roleUnknown, errPermissionDenied
 	}
 
 	// Ensure the client certificate was verified against our CA.
 	chains := tlsInfo.State.VerifiedChains
 	if len(chains) == 0 || len(chains[0]) == 0 {
-		return 0, errPermissionDenied
+		return roleUnknown, errPermissionDenied
 	}
 
 	// The leaf certificate's CN determines identity.
@@ -110,7 +110,7 @@ func authenticate(ctx context.Context) (role, error) {
 	// Map CN to a known role.
 	r, known := cnToRole[cn]
 	if !known {
-		return 0, errPermissionDenied
+		return roleUnknown, errPermissionDenied
 	}
 
 	return r, nil
