@@ -22,9 +22,6 @@ type Server struct {
 	logger  *slog.Logger
 }
 
-// Compile-time check: ensure Server satisfies the generated interface.
-var _ pb.JobWorkerServer = (*Server)(nil)
-
 // New creates a Server that delegates job operations to the given JobManager.
 func New(manager *worker.JobManager, logger *slog.Logger) *Server {
 	return &Server{manager: manager, logger: logger}
