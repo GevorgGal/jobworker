@@ -12,8 +12,12 @@ import (
 type JobStatus int
 
 const (
+	// JobStatusUnspecified is the zero value, never set on a real job.
+	// It ensures callers who forget to check errors don't see a
+	// misleading "Running" status.
+	JobStatusUnspecified JobStatus = iota
 	// JobStatusRunning indicates the process is still executing.
-	JobStatusRunning JobStatus = iota
+	JobStatusRunning
 	// JobStatusExited indicates the process terminated on its own.
 	JobStatusExited
 	// JobStatusStopped indicates the process was terminated via Stop.
@@ -64,13 +68,10 @@ func startJob(id, command string, args []string) (*Job, error) {
 	cmd.Stderr = output
 
 	if err := cmd.Start(); err != nil {
-		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
-			// Wrap as ErrInvalidCommand only; the underlying cause is included
-			// in the message for diagnostics but not in the error chain, keeping
-			// exec internals out of the library's public API.
-			return nil, fmt.Errorf("%w: %v", ErrInvalidCommand, err)
-		}
-		return nil, err
+		// Any Start failure means the process didn't launch — wrap uniformly.
+		// The underlying cause is in the message for diagnostics but not in
+		// the error chain, keeping exec internals out of the library's public API.
+		return nil, fmt.Errorf("%w: %v", ErrInvalidCommand, err)
 	}
 
 	j := &Job{
