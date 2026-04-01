@@ -3,6 +3,7 @@
 package worker
 
 import (
+	"context"
 	"errors"
 	"sync"
 
@@ -81,4 +82,22 @@ func (m *JobManager) GetOutputReader(id string) (*OutputReader, error) {
 	}
 
 	return job.Output().NewReader(), nil
+}
+
+// WaitForExit blocks until the job has fully terminated or ctx is cancelled.
+func (m *JobManager) WaitForExit(ctx context.Context, id string) error {
+	m.mu.RLock()
+	job, ok := m.jobs[id]
+	m.mu.RUnlock()
+
+	if !ok {
+		return ErrJobNotFound
+	}
+
+	select {
+	case <-job.Done():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
