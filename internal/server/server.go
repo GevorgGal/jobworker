@@ -15,32 +15,38 @@ import (
 	pb "github.com/GevorgGal/jobworker/proto/jobworker/v1"
 )
 
+// Manager defines the job operations the server depends on.
+// *worker.JobManager implements this interface.
+type Manager interface {
+	Start(command string, args []string) (string, error)
+	Stop(id string) error
+	GetStatus(id string) (worker.JobStatus, int, error)
+	GetOutputReader(id string) (*worker.OutputReader, error)
+}
+
 // Server implements the pb.JobWorkerServer gRPC interface.
 type Server struct {
 	pb.UnimplementedJobWorkerServer
-	manager *worker.JobManager
+	manager Manager
 	logger  *slog.Logger
 }
 
-// New creates a Server that delegates job operations to the given JobManager.
-func New(manager *worker.JobManager, logger *slog.Logger) *Server {
+// New creates a Server that delegates job operations to the given Manager.
+func New(manager Manager, logger *slog.Logger) *Server {
 	return &Server{manager: manager, logger: logger}
 }
 
 // Start launches a new process and returns its job ID.
 func (s *Server) Start(ctx context.Context, req *pb.StartRequest) (*pb.StartResponse, error) {
-	// TODO: Pass ctx to manager methods to support request cancellation.
 	if req.GetCommand() == "" {
 		return nil, status.Error(codes.InvalidArgument, "command is required")
 	}
 
 	id, err := s.manager.Start(req.GetCommand(), req.GetArgs())
 	if err != nil {
-		// Start has method-specific error mapping; Stop/GetStatus use mapError.
 		if errors.Is(err, worker.ErrInvalidCommand) {
 			return nil, status.Errorf(codes.InvalidArgument, "command not found or not executable: %s", req.GetCommand())
 		}
-		// Unrecognized errors default to Internal to avoid leaking server details.
 		s.logger.Error("failed to start job", "command", req.GetCommand(), "error", err)
 		return nil, status.Error(codes.Internal, "internal error")
 	}
@@ -53,30 +59,31 @@ func (s *Server) Start(ctx context.Context, req *pb.StartRequest) (*pb.StartResp
 
 // Stop terminates a running job.
 func (s *Server) Stop(ctx context.Context, req *pb.StopRequest) (*pb.StopResponse, error) {
-	// TODO: Pass ctx to manager methods to support request cancellation.
 	if req.GetJobId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "job_id is required")
 	}
 
+	logger := s.logger.With("op", "stop", "job_id", req.GetJobId())
+
 	if err := s.manager.Stop(req.GetJobId()); err != nil {
-		return nil, s.mapError("stop", req.GetJobId(), err)
+		return nil, mapError(logger.With("error", err), err)
 	}
 
-	s.logger.Info("job stopped", "job_id", req.GetJobId())
-
+	logger.Info("job stopped")
 	return &pb.StopResponse{}, nil
 }
 
 // GetStatus returns the current state and exit code of a job.
 func (s *Server) GetStatus(ctx context.Context, req *pb.GetStatusRequest) (*pb.GetStatusResponse, error) {
-	// TODO: Pass ctx to manager methods to support request cancellation.
 	if req.GetJobId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "job_id is required")
 	}
 
+	logger := s.logger.With("op", "get_status", "job_id", req.GetJobId())
+
 	jobStatus, exitCode, err := s.manager.GetStatus(req.GetJobId())
 	if err != nil {
-		return nil, s.mapError("get_status", req.GetJobId(), err)
+		return nil, mapError(logger.With("error", err), err)
 	}
 
 	return &pb.GetStatusResponse{
@@ -94,53 +101,49 @@ func (s *Server) StreamOutput(req *pb.StreamOutputRequest, stream pb.JobWorker_S
 		return status.Error(codes.InvalidArgument, "job_id is required")
 	}
 
+	logger := s.logger.With("op", "stream_output", "job_id", req.GetJobId())
+
 	reader, err := s.manager.GetOutputReader(req.GetJobId())
 	if err != nil {
-		return s.mapError("stream_output", req.GetJobId(), err)
+		return mapError(logger.With("error", err), err)
 	}
 
-	s.logger.Debug("streaming output", "job_id", req.GetJobId())
+	logger.Debug("streaming started")
 
 	ctx := stream.Context()
 	for {
-		// reader.Read returns at most maxReadSize (32KB) bytes per call,
-		// which becomes one gRPC message. Chunking is handled by the buffer layer.
 		data, err := reader.Read(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				s.logger.Debug("stream completed", "job_id", req.GetJobId())
+				logger.Debug("stream completed")
 				return nil
 			}
-			// Context cancellation (client disconnect) or deadline exceeded.
-			// Return as-is; gRPC maps context errors to appropriate status codes.
 			if ctx.Err() != nil {
-				s.logger.Debug("stream ended", "job_id", req.GetJobId(), "reason", err)
+				logger.Debug("stream ended", "error", err)
 				return err
 			}
-			// Unexpected error — log and return generic message to avoid leaking details.
-			s.logger.Error("unexpected stream error", "job_id", req.GetJobId(), "error", err)
+			logger.Error("unexpected stream error", "error", err)
 			return status.Error(codes.Internal, "internal error")
 		}
 
 		if err := stream.Send(&pb.StreamOutputResponse{Data: data}); err != nil {
-			s.logger.Debug("stream send failed", "job_id", req.GetJobId(), "error", err)
+			logger.Debug("stream send failed", "error", err)
 			return err
 		}
 	}
 }
 
 // mapError translates worker library errors to gRPC status codes.
-// Unrecognized errors are logged and returned as Internal.
-func (s *Server) mapError(op, jobID string, err error) error {
+// Only unexpected errors are logged; expected errors (not found, already stopped)
+// are communicated via gRPC status codes without additional logging.
+func mapError(logger *slog.Logger, err error) error {
 	switch {
 	case errors.Is(err, worker.ErrJobNotFound):
-		s.logger.Debug("job not found", "op", op, "job_id", jobID)
 		return status.Error(codes.NotFound, "job not found")
 	case errors.Is(err, worker.ErrAlreadyStopped):
-		s.logger.Debug("job already terminated", "op", op, "job_id", jobID)
 		return status.Error(codes.FailedPrecondition, "job has already terminated")
 	default:
-		s.logger.Error("unexpected error", "op", op, "job_id", jobID, "error", err)
+		logger.Error("request failed")
 		return status.Error(codes.Internal, "internal error")
 	}
 }

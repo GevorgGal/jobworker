@@ -6,10 +6,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,55 +28,69 @@ import (
 )
 
 // ---------------------------------------------------------------------------
+// Mock manager
+// ---------------------------------------------------------------------------
+
+// mockManager implements server.Manager with configurable function fields.
+// Unconfigured methods panic with a descriptive message — this catches
+// unexpected interactions immediately rather than returning silent errors.
+type mockManager struct {
+	startFn     func(string, []string) (string, error)
+	stopFn      func(string) error
+	statusFn    func(string) (worker.JobStatus, int, error)
+	outReaderFn func(string) (*worker.OutputReader, error)
+}
+
+func (m *mockManager) Start(cmd string, args []string) (string, error) {
+	return m.startFn(cmd, args)
+}
+
+func (m *mockManager) Stop(id string) error {
+	return m.stopFn(id)
+}
+
+func (m *mockManager) GetStatus(id string) (worker.JobStatus, int, error) {
+	return m.statusFn(id)
+}
+
+func (m *mockManager) GetOutputReader(id string) (*worker.OutputReader, error) {
+	return m.outReaderFn(id)
+}
+
+// defaultMock returns a mock where every method panics. Tests override
+// only the methods they exercise — if an unexpected method is called
+// (e.g., validation was accidentally removed), the panic catches it.
+func defaultMock() *mockManager {
+	return &mockManager{
+		startFn:     func(string, []string) (string, error) { panic("unexpected Start call") },
+		stopFn:      func(string) error { panic("unexpected Stop call") },
+		statusFn:    func(string) (worker.JobStatus, int, error) { panic("unexpected GetStatus call") },
+		outReaderFn: func(string) (*worker.OutputReader, error) { panic("unexpected GetOutputReader call") },
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// testEnv holds a connected gRPC client and the underlying JobManager.
-type testEnv struct {
-	client  pb.JobWorkerClient
-	manager *worker.JobManager
-}
-
-// newTestEnv creates an in-process gRPC server and client over bufconn
+// newClient creates an in-process gRPC server and client over bufconn
 // with no authentication — for testing server logic in isolation.
-func newTestEnv(t *testing.T) *testEnv {
-	t.Helper()
-	return setupEnv(t, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
-}
-
-// newTestEnvWithAuth creates an in-process gRPC server and client with
-// auth interceptors. The given CN is injected into the peer's TLS state
-// via fake transport credentials so the interceptor sees it.
-func newTestEnvWithAuth(t *testing.T, cn string) *testEnv {
-	t.Helper()
-	creds := &fakeCreds{cn: cn}
-	return setupEnv(t,
-		[]grpc.ServerOption{
-			grpc.Creds(creds),
-			grpc.UnaryInterceptor(auth.UnaryInterceptor()),
-			grpc.StreamInterceptor(auth.StreamInterceptor()),
-		},
-		grpc.WithTransportCredentials(creds),
-	)
-}
-
-func setupEnv(t *testing.T, serverOpts []grpc.ServerOption, dialOpts ...grpc.DialOption) *testEnv {
+func newClient(t *testing.T, mgr server.Manager) pb.JobWorkerClient {
 	t.Helper()
 
 	lis := bufconn.Listen(1024 * 1024)
-	mgr := worker.NewJobManager()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	srv := grpc.NewServer(serverOpts...)
+	srv := grpc.NewServer()
 	pb.RegisterJobWorkerServer(srv, server.New(mgr, logger))
-
 	go func() { _ = srv.Serve(lis) }()
 
-	dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-		return lis.DialContext(ctx)
-	}))
-
-	conn, err := grpc.NewClient("passthrough:///bufnet", dialOpts...)
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+	)
 	if err != nil {
 		t.Fatalf("grpc.NewClient: %v", err)
 	}
@@ -86,18 +100,84 @@ func setupEnv(t *testing.T, serverOpts []grpc.ServerOption, dialOpts ...grpc.Dia
 		srv.Stop()
 	})
 
-	return &testEnv{
-		client:  pb.NewJobWorkerClient(conn),
-		manager: mgr,
+	return pb.NewJobWorkerClient(conn)
+}
+
+// newAuthClient creates an in-process gRPC server and client with auth
+// interceptors. The given CN is injected into the peer's TLS state
+// via fake transport credentials so the interceptor sees it.
+func newAuthClient(t *testing.T, mgr server.Manager, cn string) pb.JobWorkerClient {
+	t.Helper()
+
+	lis := bufconn.Listen(1024 * 1024)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	creds := &fakeCreds{cn: cn}
+
+	srv := grpc.NewServer(
+		grpc.Creds(creds),
+		grpc.UnaryInterceptor(auth.UnaryInterceptor()),
+		grpc.StreamInterceptor(auth.StreamInterceptor()),
+	)
+	pb.RegisterJobWorkerServer(srv, server.New(mgr, logger))
+	go func() { _ = srv.Serve(lis) }()
+
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithTransportCredentials(creds),
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+
+	t.Cleanup(func() {
+		conn.Close()
+		srv.Stop()
+	})
+
+	return pb.NewJobWorkerClient(conn)
+}
+
+// completedReader creates an OutputReader backed by a buffer that already
+// contains all its data and is marked done — no real process needed.
+func completedReader(data []byte) *worker.OutputReader {
+	buf := worker.NewOutputBuffer()
+	if len(data) > 0 {
+		buf.Write(data)
+	}
+	buf.MarkDone()
+	return buf.NewReader()
+}
+
+// collectOutput streams all output from a job and returns it. Blocks until
+// the stream completes (EOF) or a 5-second timeout fires.
+func collectOutput(t *testing.T, client pb.JobWorkerClient, jobID string) []byte {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: jobID})
+	if err != nil {
+		t.Fatalf("StreamOutput(%s): %v", jobID, err)
+	}
+
+	var out []byte
+	for {
+		msg, err := stream.Recv()
+		if err == io.EOF {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("stream.Recv: %v", err)
+		}
+		out = append(out, msg.GetData()...)
 	}
 }
 
 // fakeCreds implements credentials.TransportCredentials to inject a fixed
-// TLS peer identity into every connection. The auth interceptor sees the CN
-// without a real TLS handshake.
-type fakeCreds struct {
-	cn string
-}
+// CN into every connection's TLS state without a real TLS handshake.
+type fakeCreds struct{ cn string }
 
 func (c *fakeCreds) ClientHandshake(_ context.Context, _ string, conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	return conn, c.tlsInfo(), nil
@@ -129,80 +209,64 @@ func (c *fakeCreds) tlsInfo() credentials.TLSInfo {
 	}
 }
 
-// collectOutput streams all output from a job and returns it. Blocks until
-// the stream completes (job exits) or a 5-second timeout fires.
-func collectOutput(t *testing.T, client pb.JobWorkerClient, jobID string) []byte {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-
-	stream, err := client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: jobID})
-	if err != nil {
-		t.Fatalf("StreamOutput(%s): %v", jobID, err)
-	}
-
-	var out []byte
-	for {
-		msg, err := stream.Recv()
-		if err == io.EOF {
-			return out
-		}
-		if err != nil {
-			t.Fatalf("stream.Recv: %v", err)
-		}
-		out = append(out, msg.GetData()...)
-	}
-}
-
-// awaitJobExit blocks until the job has fully terminated using the
-// manager's WaitForExit — independent of streaming correctness.
-func awaitJobExit(t *testing.T, env *testEnv, jobID string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-
-	if err := env.manager.WaitForExit(ctx, jobID); err != nil {
-		t.Fatalf("awaitJobExit(%s): %v", jobID, err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
 func TestServer_Start(t *testing.T) {
-	env := newTestEnv(t)
-
-	resp, err := env.client.Start(t.Context(), &pb.StartRequest{
-		Command: "echo",
-		Args:    []string{"hello"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if resp.GetJobId() == "" {
-		t.Fatal("Start returned empty job ID")
-	}
-}
-
-func TestServer_StartErrors(t *testing.T) {
-	env := newTestEnv(t)
-	ctx := t.Context()
-
 	tests := []struct {
-		name string
-		req  *pb.StartRequest
-		code codes.Code
+		name   string
+		req    *pb.StartRequest
+		setup  func(m *mockManager)
+		code   codes.Code
+		wantID string
 	}{
-		{"empty command", &pb.StartRequest{}, codes.InvalidArgument},
-		{"invalid binary", &pb.StartRequest{Command: "/nonexistent/binary"}, codes.InvalidArgument},
+		{
+			name: "success",
+			req:  &pb.StartRequest{Command: "echo", Args: []string{"hello"}},
+			setup: func(m *mockManager) {
+				m.startFn = func(string, []string) (string, error) { return "job-123", nil }
+			},
+			code:   codes.OK,
+			wantID: "job-123",
+		},
+		{
+			name: "empty command",
+			req:  &pb.StartRequest{},
+			code: codes.InvalidArgument,
+		},
+		{
+			name: "invalid command",
+			req:  &pb.StartRequest{Command: "/nonexistent"},
+			setup: func(m *mockManager) {
+				m.startFn = func(string, []string) (string, error) { return "", worker.ErrInvalidCommand }
+			},
+			code: codes.InvalidArgument,
+		},
+		{
+			name: "internal error",
+			req:  &pb.StartRequest{Command: "echo"},
+			setup: func(m *mockManager) {
+				m.startFn = func(string, []string) (string, error) { return "", errors.New("unexpected") }
+			},
+			code: codes.Internal,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := env.client.Start(ctx, tt.req)
+			mock := defaultMock()
+			if tt.setup != nil {
+				tt.setup(mock)
+			}
+			client := newClient(t, mock)
+
+			resp, err := client.Start(t.Context(), tt.req)
 			if got := status.Code(err); got != tt.code {
-				t.Fatalf("Start: got %v, want %v", got, tt.code)
+				t.Fatalf("code = %v, want %v", got, tt.code)
+			}
+			if tt.code == codes.OK && resp.GetJobId() != tt.wantID {
+				t.Fatalf("job_id = %q, want %q", resp.GetJobId(), tt.wantID)
 			}
 		})
 	}
@@ -213,68 +277,54 @@ func TestServer_StartErrors(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServer_Stop(t *testing.T) {
-	env := newTestEnv(t)
-	ctx := t.Context()
-
-	resp, err := env.client.Start(ctx, &pb.StartRequest{
-		Command: "sleep",
-		Args:    []string{"60"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	id := resp.GetJobId()
-
-	if _, err := env.client.Stop(ctx, &pb.StopRequest{JobId: id}); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	awaitJobExit(t, env, id)
-
-	st, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: id})
-	if err != nil {
-		t.Fatalf("GetStatus: %v", err)
-	}
-	if st.GetStatus() != pb.JobStatus_JOB_STATUS_STOPPED {
-		t.Fatalf("status = %v, want STOPPED", st.GetStatus())
-	}
-}
-
-func TestServer_StopAlreadyExited(t *testing.T) {
-	env := newTestEnv(t)
-	ctx := t.Context()
-
-	resp, err := env.client.Start(ctx, &pb.StartRequest{Command: "true"})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	awaitJobExit(t, env, resp.GetJobId())
-
-	_, err = env.client.Stop(ctx, &pb.StopRequest{JobId: resp.GetJobId()})
-	if got := status.Code(err); got != codes.FailedPrecondition {
-		t.Fatalf("Stop on exited job: got %v, want FailedPrecondition", got)
-	}
-}
-
-func TestServer_StopErrors(t *testing.T) {
-	env := newTestEnv(t)
-	ctx := t.Context()
-
 	tests := []struct {
 		name  string
 		jobID string
+		setup func(m *mockManager)
 		code  codes.Code
 	}{
-		{"empty job_id", "", codes.InvalidArgument},
-		{"not found", "nonexistent", codes.NotFound},
+		{
+			name:  "success",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.stopFn = func(string) error { return nil }
+			},
+			code: codes.OK,
+		},
+		{
+			name:  "empty job_id",
+			jobID: "",
+			code:  codes.InvalidArgument,
+		},
+		{
+			name:  "not found",
+			jobID: "nonexistent",
+			setup: func(m *mockManager) {
+				m.stopFn = func(string) error { return worker.ErrJobNotFound }
+			},
+			code: codes.NotFound,
+		},
+		{
+			name:  "already stopped",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.stopFn = func(string) error { return worker.ErrAlreadyStopped }
+			},
+			code: codes.FailedPrecondition,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := env.client.Stop(ctx, &pb.StopRequest{JobId: tt.jobID})
+			mock := defaultMock()
+			if tt.setup != nil {
+				tt.setup(mock)
+			}
+			client := newClient(t, mock)
+
+			_, err := client.Stop(t.Context(), &pb.StopRequest{JobId: tt.jobID})
 			if got := status.Code(err); got != tt.code {
-				t.Fatalf("Stop: got %v, want %v", got, tt.code)
+				t.Fatalf("code = %v, want %v", got, tt.code)
 			}
 		})
 	}
@@ -284,94 +334,98 @@ func TestServer_StopErrors(t *testing.T) {
 // GetStatus
 // ---------------------------------------------------------------------------
 
-func TestServer_GetStatusLifecycle(t *testing.T) {
-	env := newTestEnv(t)
-	ctx := t.Context()
-
-	resp, err := env.client.Start(ctx, &pb.StartRequest{
-		Command: "sleep",
-		Args:    []string{"60"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	id := resp.GetJobId()
-
-	// Running.
-	st, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: id})
-	if err != nil {
-		t.Fatalf("GetStatus: %v", err)
-	}
-	if st.GetJobId() != id {
-		t.Fatalf("job_id = %q, want %q", st.GetJobId(), id)
-	}
-	if st.GetStatus() != pb.JobStatus_JOB_STATUS_RUNNING {
-		t.Fatalf("status = %v, want RUNNING", st.GetStatus())
-	}
-
-	// Stop and verify transition.
-	if _, err := env.client.Stop(ctx, &pb.StopRequest{JobId: id}); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-
-	awaitJobExit(t, env, id)
-
-	st, err = env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: id})
-	if err != nil {
-		t.Fatalf("GetStatus after stop: %v", err)
-	}
-	if st.GetStatus() != pb.JobStatus_JOB_STATUS_STOPPED {
-		t.Fatalf("status = %v, want STOPPED", st.GetStatus())
-	}
-	if st.GetExitCode() != -1 {
-		t.Fatalf("exit_code = %d, want -1", st.GetExitCode())
-	}
-}
-
-func TestServer_GetStatusNaturalExit(t *testing.T) {
-	env := newTestEnv(t)
-	ctx := t.Context()
-
-	resp, err := env.client.Start(ctx, &pb.StartRequest{
-		Command: "sh",
-		Args:    []string{"-c", "exit 42"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	awaitJobExit(t, env, resp.GetJobId())
-
-	st, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: resp.GetJobId()})
-	if err != nil {
-		t.Fatalf("GetStatus: %v", err)
-	}
-	if st.GetStatus() != pb.JobStatus_JOB_STATUS_EXITED {
-		t.Fatalf("status = %v, want EXITED", st.GetStatus())
-	}
-	if st.GetExitCode() != 42 {
-		t.Fatalf("exit_code = %d, want 42", st.GetExitCode())
-	}
-}
-
-func TestServer_GetStatusErrors(t *testing.T) {
-	env := newTestEnv(t)
-	ctx := t.Context()
-
+func TestServer_GetStatus(t *testing.T) {
 	tests := []struct {
-		name  string
-		jobID string
-		code  codes.Code
+		name       string
+		jobID      string
+		setup      func(m *mockManager)
+		code       codes.Code
+		wantStatus pb.JobStatus
+		wantExit   int32
 	}{
-		{"empty job_id", "", codes.InvalidArgument},
-		{"not found", "nonexistent", codes.NotFound},
+		{
+			name:  "running",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.statusFn = func(string) (worker.JobStatus, int, error) {
+					return worker.JobStatusRunning, 0, nil
+				}
+			},
+			code:       codes.OK,
+			wantStatus: pb.JobStatus_JOB_STATUS_RUNNING,
+		},
+		{
+			name:  "exited success",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.statusFn = func(string) (worker.JobStatus, int, error) {
+					return worker.JobStatusExited, 0, nil
+				}
+			},
+			code:       codes.OK,
+			wantStatus: pb.JobStatus_JOB_STATUS_EXITED,
+		},
+		{
+			name:  "exited with code",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.statusFn = func(string) (worker.JobStatus, int, error) {
+					return worker.JobStatusExited, 42, nil
+				}
+			},
+			code:       codes.OK,
+			wantStatus: pb.JobStatus_JOB_STATUS_EXITED,
+			wantExit:   42,
+		},
+		{
+			name:  "stopped",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.statusFn = func(string) (worker.JobStatus, int, error) {
+					return worker.JobStatusStopped, -1, nil
+				}
+			},
+			code:       codes.OK,
+			wantStatus: pb.JobStatus_JOB_STATUS_STOPPED,
+			wantExit:   -1,
+		},
+		{
+			name:  "empty job_id",
+			jobID: "",
+			code:  codes.InvalidArgument,
+		},
+		{
+			name:  "not found",
+			jobID: "nonexistent",
+			setup: func(m *mockManager) {
+				m.statusFn = func(string) (worker.JobStatus, int, error) {
+					return 0, 0, worker.ErrJobNotFound
+				}
+			},
+			code: codes.NotFound,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: tt.jobID})
+			mock := defaultMock()
+			if tt.setup != nil {
+				tt.setup(mock)
+			}
+			client := newClient(t, mock)
+
+			resp, err := client.GetStatus(t.Context(), &pb.GetStatusRequest{JobId: tt.jobID})
 			if got := status.Code(err); got != tt.code {
-				t.Fatalf("GetStatus: got %v, want %v", got, tt.code)
+				t.Fatalf("code = %v, want %v", got, tt.code)
+			}
+			if tt.code != codes.OK {
+				return
+			}
+			if resp.GetStatus() != tt.wantStatus {
+				t.Fatalf("status = %v, want %v", resp.GetStatus(), tt.wantStatus)
+			}
+			if resp.GetExitCode() != tt.wantExit {
+				t.Fatalf("exit_code = %d, want %d", resp.GetExitCode(), tt.wantExit)
 			}
 		})
 	}
@@ -382,215 +436,182 @@ func TestServer_GetStatusErrors(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServer_StreamOutput(t *testing.T) {
-	env := newTestEnv(t)
-
-	resp, err := env.client.Start(t.Context(), &pb.StartRequest{
-		Command: "echo",
-		Args:    []string{"hello world"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
+	tests := []struct {
+		name  string
+		jobID string
+		setup func(m *mockManager)
+		code  codes.Code
+		want  []byte
+	}{
+		{
+			name:  "complete output",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.outReaderFn = func(string) (*worker.OutputReader, error) {
+					return completedReader([]byte("hello world\n")), nil
+				}
+			},
+			code: codes.OK,
+			want: []byte("hello world\n"),
+		},
+		{
+			name:  "empty output",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.outReaderFn = func(string) (*worker.OutputReader, error) {
+					return completedReader(nil), nil
+				}
+			},
+			code: codes.OK,
+		},
+		{
+			name:  "binary data preserved",
+			jobID: "job-1",
+			setup: func(m *mockManager) {
+				m.outReaderFn = func(string) (*worker.OutputReader, error) {
+					return completedReader([]byte{0x00, 0x01, 0x02, 0xff, 0xfe}), nil
+				}
+			},
+			code: codes.OK,
+			want: []byte{0x00, 0x01, 0x02, 0xff, 0xfe},
+		},
+		{
+			name:  "empty job_id",
+			jobID: "",
+			code:  codes.InvalidArgument,
+		},
+		{
+			name:  "not found",
+			jobID: "nonexistent",
+			setup: func(m *mockManager) {
+				m.outReaderFn = func(string) (*worker.OutputReader, error) {
+					return nil, worker.ErrJobNotFound
+				}
+			},
+			code: codes.NotFound,
+		},
 	}
 
-	out := collectOutput(t, env.client, resp.GetJobId())
-	if got := string(out); got != "hello world\n" {
-		t.Fatalf("output = %q, want %q", got, "hello world\n")
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := defaultMock()
+			if tt.setup != nil {
+				tt.setup(mock)
+			}
+			client := newClient(t, mock)
 
-	// collectOutput drains until EOF, so the job has exited. Verify clean exit.
-	st, err := env.client.GetStatus(t.Context(), &pb.GetStatusRequest{JobId: resp.GetJobId()})
-	if err != nil {
-		t.Fatalf("GetStatus: %v", err)
-	}
-	if st.GetStatus() != pb.JobStatus_JOB_STATUS_EXITED {
-		t.Fatalf("status = %v, want EXITED", st.GetStatus())
-	}
-	if st.GetExitCode() != 0 {
-		t.Fatalf("exit_code = %d, want 0", st.GetExitCode())
+			// Error cases: for server-streaming RPCs, the error may surface on Recv.
+			if tt.code != codes.OK {
+				stream, err := client.StreamOutput(t.Context(), &pb.StreamOutputRequest{JobId: tt.jobID})
+				if err == nil {
+					_, err = stream.Recv()
+				}
+				if got := status.Code(err); got != tt.code {
+					t.Fatalf("code = %v, want %v", got, tt.code)
+				}
+				return
+			}
+
+			out := collectOutput(t, client, tt.jobID)
+			if !bytes.Equal(out, tt.want) {
+				t.Fatalf("output = %x, want %x", out, tt.want)
+			}
+		})
 	}
 }
 
 func TestServer_StreamOutputLive(t *testing.T) {
-	env := newTestEnv(t)
+	buf := worker.NewOutputBuffer()
+	mock := defaultMock()
+	mock.outReaderFn = func(string) (*worker.OutputReader, error) {
+		return buf.NewReader(), nil
+	}
+	client := newClient(t, mock)
+
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	// "exec sleep" replaces the shell process with sleep, eliminating
-	// any race between echo completing and sleep starting.
-	resp, err := env.client.Start(ctx, &pb.StartRequest{
-		Command: "sh",
-		Args:    []string{"-c", "echo live; exec sleep 60"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	id := resp.GetJobId()
-	t.Cleanup(func() { _ = env.manager.Stop(id) })
-
-	stream, err := env.client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: id})
+	stream, err := client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: "job-1"})
 	if err != nil {
 		t.Fatalf("StreamOutput: %v", err)
 	}
 
-	// First chunk arrives while the process is still running. Use Contains
-	// rather than exact match — write granularity depends on shell flushing.
+	// Write after stream is open — proves live delivery without polling.
+	buf.Write([]byte("live\n"))
+
 	msg, err := stream.Recv()
 	if err != nil {
-		t.Fatalf("first Recv: %v", err)
+		t.Fatalf("Recv: %v", err)
 	}
-	if got := string(msg.GetData()); !strings.Contains(got, "live") {
-		t.Fatalf("first chunk = %q, want it to contain %q", got, "live")
+	if got := string(msg.GetData()); got != "live\n" {
+		t.Fatalf("got %q, want %q", got, "live\n")
 	}
 
-	// Confirm the process hasn't exited — proves streaming is live.
-	st, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: id})
-	if err != nil {
-		t.Fatalf("GetStatus: %v", err)
-	}
-	if st.GetStatus() != pb.JobStatus_JOB_STATUS_RUNNING {
-		t.Fatalf("expected RUNNING, got %v", st.GetStatus())
-	}
-}
+	// Mark done — stream should complete with EOF.
+	buf.MarkDone()
 
-func TestServer_StreamOutputReplay(t *testing.T) {
-	env := newTestEnv(t)
-
-	resp, err := env.client.Start(t.Context(), &pb.StartRequest{
-		Command: "echo",
-		Args:    []string{"replay"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	id := resp.GetJobId()
-
-	// Wait for job to complete.
-	awaitJobExit(t, env, id)
-
-	// A new stream after completion should replay all output.
-	out := collectOutput(t, env.client, id)
-	if got := string(out); got != "replay\n" {
-		t.Fatalf("replayed output = %q, want %q", got, "replay\n")
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("expected EOF after MarkDone, got: %v", err)
 	}
 }
 
 func TestServer_StreamOutputConcurrentReaders(t *testing.T) {
-	env := newTestEnv(t)
-
-	resp, err := env.client.Start(t.Context(), &pb.StartRequest{
-		Command: "sh",
-		Args:    []string{"-c", "for i in 1 2 3 4 5; do echo line$i; sleep 0.05; done"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
+	buf := worker.NewOutputBuffer()
+	mock := defaultMock()
+	mock.outReaderFn = func(string) (*worker.OutputReader, error) {
+		return buf.NewReader(), nil
 	}
-	id := resp.GetJobId()
+	client := newClient(t, mock)
 
-	// Exact match is safe here: each echo is a separate write syscall that
-	// the buffer captures atomically, and the sleep ensures writes don't coalesce.
+	// Write in a goroutine to test live concurrent streaming.
+	go func() {
+		for _, line := range []string{"line1\n", "line2\n", "line3\n", "line4\n", "line5\n"} {
+			buf.Write([]byte(line))
+			time.Sleep(10 * time.Millisecond)
+		}
+		buf.MarkDone()
+	}()
+
 	want := "line1\nline2\nline3\nline4\nline5\n"
 
 	const numReaders = 3
 	var wg sync.WaitGroup
 	for range numReaders {
-		wg.Go(func() {
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
-
-			stream, err := env.client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: id})
-			if err != nil {
-				t.Errorf("StreamOutput: %v", err)
-				return
-			}
-
-			var out []byte
-			for {
-				msg, err := stream.Recv()
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					t.Errorf("Recv: %v", err)
-					return
-				}
-				out = append(out, msg.GetData()...)
-			}
-
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out := collectOutput(t, client, "job-1")
 			if got := string(out); got != want {
 				t.Errorf("reader got %q, want %q", got, want)
 			}
-		})
+		}()
 	}
 	wg.Wait()
 }
 
-func TestServer_StreamOutputEmpty(t *testing.T) {
-	env := newTestEnv(t)
-
-	resp, err := env.client.Start(t.Context(), &pb.StartRequest{Command: "true"})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	out := collectOutput(t, env.client, resp.GetJobId())
-	if len(out) != 0 {
-		t.Fatalf("expected empty output, got %q", out)
-	}
-}
-
-func TestServer_StreamOutputStderr(t *testing.T) {
-	env := newTestEnv(t)
-
-	resp, err := env.client.Start(t.Context(), &pb.StartRequest{
-		Command: "sh",
-		Args:    []string{"-c", "echo out; echo err >&2"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	// Use Contains — stdout/stderr interleaving order is not guaranteed.
-	out := collectOutput(t, env.client, resp.GetJobId())
-	got := string(out)
-	if !strings.Contains(got, "out") || !strings.Contains(got, "err") {
-		t.Fatalf("output = %q, want both stdout and stderr", got)
-	}
-}
-
-func TestServer_StreamOutputBinary(t *testing.T) {
-	env := newTestEnv(t)
-
-	// Octal escapes are universally supported by printf, unlike \x hex escapes.
-	resp, err := env.client.Start(t.Context(), &pb.StartRequest{
-		Command: "printf",
-		Args:    []string{`\000\001\002\377\376`},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	out := collectOutput(t, env.client, resp.GetJobId())
-	want := []byte{0x00, 0x01, 0x02, 0xff, 0xfe}
-	if !bytes.Equal(out, want) {
-		t.Fatalf("binary output = %x, want %x", out, want)
-	}
-}
-
 func TestServer_StreamOutputClientCancel(t *testing.T) {
-	env := newTestEnv(t)
-
-	resp, err := env.client.Start(t.Context(), &pb.StartRequest{
-		Command: "sh",
-		Args:    []string{"-c", "while true; do echo x; sleep 0.1; done"},
-	})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
+	// Buffer that never completes — simulates a long-running job.
+	buf := worker.NewOutputBuffer()
+	mock := defaultMock()
+	mock.outReaderFn = func(string) (*worker.OutputReader, error) {
+		return buf.NewReader(), nil
 	}
-	id := resp.GetJobId()
-	t.Cleanup(func() { _ = env.manager.Stop(id) })
+	client := newClient(t, mock)
+
+	// Write continuously so there's always data available.
+	go func() {
+		for {
+			if _, err := buf.Write([]byte("x")); err != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	// Clean up: mark buffer done so the writer goroutine exits.
+	t.Cleanup(func() { buf.MarkDone() })
 
 	ctx, cancel := context.WithCancel(t.Context())
-	stream, err := env.client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: id})
+	stream, err := client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: "job-1"})
 	if err != nil {
 		t.Fatalf("StreamOutput: %v", err)
 	}
@@ -613,104 +634,86 @@ func TestServer_StreamOutputClientCancel(t *testing.T) {
 	}
 }
 
-func TestServer_StreamOutputErrors(t *testing.T) {
-	env := newTestEnv(t)
+// ---------------------------------------------------------------------------
+// Authorization — verifies interceptors are wired correctly end-to-end.
+// The full CN × method matrix is covered in auth_test.go.
+// ---------------------------------------------------------------------------
+
+func TestServer_AuthAdminAllowed(t *testing.T) {
+	mock := defaultMock()
+	mock.startFn = func(string, []string) (string, error) { return "job-1", nil }
+	mock.stopFn = func(string) error { return nil }
+	mock.statusFn = func(string) (worker.JobStatus, int, error) { return worker.JobStatusRunning, 0, nil }
+	mock.outReaderFn = func(string) (*worker.OutputReader, error) {
+		return completedReader([]byte("output")), nil
+	}
+	client := newAuthClient(t, mock, "admin")
+	ctx := t.Context()
+
+	if _, err := client.Start(ctx, &pb.StartRequest{Command: "echo"}); err != nil {
+		t.Fatalf("admin Start: %v", err)
+	}
+	if _, err := client.Stop(ctx, &pb.StopRequest{JobId: "job-1"}); err != nil {
+		t.Fatalf("admin Stop: %v", err)
+	}
+	if _, err := client.GetStatus(ctx, &pb.GetStatusRequest{JobId: "job-1"}); err != nil {
+		t.Fatalf("admin GetStatus: %v", err)
+	}
+	out := collectOutput(t, client, "job-1")
+	if len(out) == 0 {
+		t.Fatal("admin StreamOutput: got no output")
+	}
+}
+
+func TestServer_AuthViewerBlocked(t *testing.T) {
+	client := newAuthClient(t, defaultMock(), "viewer")
 	ctx := t.Context()
 
 	tests := []struct {
-		name  string
-		jobID string
-		code  codes.Code
+		name string
+		call func() error
 	}{
-		{"empty job_id", "", codes.InvalidArgument},
-		{"not found", "nonexistent", codes.NotFound},
+		{"Start", func() error {
+			_, err := client.Start(ctx, &pb.StartRequest{Command: "echo"})
+			return err
+		}},
+		{"Stop", func() error {
+			_, err := client.Stop(ctx, &pb.StopRequest{JobId: "any"})
+			return err
+		}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stream, err := env.client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: tt.jobID})
-			// For server-streaming RPCs, the error may surface on Recv.
-			if err == nil {
-				_, err = stream.Recv()
-			}
-			if got := status.Code(err); got != tt.code {
-				t.Fatalf("StreamOutput: got %v, want %v", got, tt.code)
+			if got := status.Code(tt.call()); got != codes.PermissionDenied {
+				t.Fatalf("viewer %s: got %v, want PermissionDenied", tt.name, got)
 			}
 		})
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Authorization integration — verifies interceptors are wired correctly.
-// The full CN × method matrix is covered in auth_test.go; here we confirm
-// end-to-end gating through a real gRPC stack.
-// ---------------------------------------------------------------------------
-
-func TestServer_AuthAdminAllowed(t *testing.T) {
-	env := newTestEnvWithAuth(t, "admin")
-	ctx := t.Context()
-
-	resp, err := env.client.Start(ctx, &pb.StartRequest{Command: "true"})
-	if err != nil {
-		t.Fatalf("admin Start: %v", err)
-	}
-
-	awaitJobExit(t, env, resp.GetJobId())
-
-	if _, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: resp.GetJobId()}); err != nil {
-		t.Fatalf("admin GetStatus: %v", err)
-	}
-
-	// Stop returns FailedPrecondition (already exited), which proves
-	// the request passed through the auth interceptor to the handler.
-	_, err = env.client.Stop(ctx, &pb.StopRequest{JobId: resp.GetJobId()})
-	if got := status.Code(err); got != codes.FailedPrecondition {
-		t.Fatalf("admin Stop: got %v, want FailedPrecondition", got)
-	}
-}
-
-func TestServer_AuthViewerBlocked(t *testing.T) {
-	env := newTestEnvWithAuth(t, "viewer")
-	ctx := t.Context()
-
-	_, err := env.client.Start(ctx, &pb.StartRequest{Command: "echo", Args: []string{"hi"}})
-	if got := status.Code(err); got != codes.PermissionDenied {
-		t.Fatalf("viewer Start: got %v, want PermissionDenied", got)
-	}
-
-	_, err = env.client.Stop(ctx, &pb.StopRequest{JobId: "any"})
-	if got := status.Code(err); got != codes.PermissionDenied {
-		t.Fatalf("viewer Stop: got %v, want PermissionDenied", got)
-	}
-}
-
 func TestServer_AuthViewerAllowed(t *testing.T) {
-	env := newTestEnvWithAuth(t, "viewer")
+	mock := defaultMock()
+	mock.statusFn = func(string) (worker.JobStatus, int, error) { return worker.JobStatusExited, 0, nil }
+	mock.outReaderFn = func(string) (*worker.OutputReader, error) {
+		return completedReader([]byte("hello\n")), nil
+	}
+	client := newAuthClient(t, mock, "viewer")
 	ctx := t.Context()
 
-	// Create a job via the manager — viewer cannot create jobs through the API.
-	id, err := env.manager.Start("echo", []string{"hello"})
-	if err != nil {
-		t.Fatalf("manager.Start: %v", err)
-	}
-
-	// Viewer can call GetStatus.
-	_, err = env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: id})
-	if err != nil {
+	if _, err := client.GetStatus(ctx, &pb.GetStatusRequest{JobId: "job-1"}); err != nil {
 		t.Fatalf("viewer GetStatus: %v", err)
 	}
-
-	// Viewer can call StreamOutput.
-	out := collectOutput(t, env.client, id)
+	out := collectOutput(t, client, "job-1")
 	if got := string(out); got != "hello\n" {
 		t.Fatalf("viewer output = %q, want %q", got, "hello\n")
 	}
 }
 
 func TestServer_AuthUnknownCN(t *testing.T) {
-	env := newTestEnvWithAuth(t, "intruder")
+	client := newAuthClient(t, defaultMock(), "intruder")
 
-	_, err := env.client.GetStatus(t.Context(), &pb.GetStatusRequest{JobId: "any"})
+	_, err := client.GetStatus(t.Context(), &pb.GetStatusRequest{JobId: "any"})
 	if got := status.Code(err); got != codes.PermissionDenied {
 		t.Fatalf("unknown CN: got %v, want PermissionDenied", got)
 	}
