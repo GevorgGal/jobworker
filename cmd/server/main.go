@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,50 +50,51 @@ func main() {
 		os.Exit(1)
 	}
 
+	manager := worker.NewJobManager()
+
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
 		grpc.UnaryInterceptor(auth.UnaryInterceptor()),
 		grpc.StreamInterceptor(auth.StreamInterceptor()),
 	)
-	pb.RegisterJobWorkerServer(srv, server.New(worker.NewJobManager(), logger))
+	pb.RegisterJobWorkerServer(srv, server.New(manager, logger))
 
 	// Register signal handler before Serve to avoid missing signals
 	// delivered between Serve starting and the goroutine being scheduled.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
-	// TODO: Stop all running jobs before exiting. Currently child processes
-	// are orphaned to init on server shutdown.
+	var forced atomic.Bool
+
 	go func() {
 		<-sigCh
 		logger.Info("shutting down...")
 
-		timer := time.NewTimer(shutdownTimeout)
-		defer timer.Stop()
+		// Stop all running jobs first — this marks output buffers as done,
+		// causing active StreamOutput RPCs to receive EOF and complete
+		// naturally, allowing GracefulStop to drain quickly.
+		manager.StopAll()
 
-		// GracefulStop waits for active RPCs to finish. Long-lived streams
-		// (e.g., StreamOutput) won't end on their own, so the shutdown timeout
-		// ensures we don't block forever.
-		done := make(chan struct{})
+		// Watchdog: force-stop on second signal or timeout.
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+
 		go func() {
-			srv.GracefulStop()
-			// Stop signal delivery before closing done so a second signal
-			// between GracefulStop returning and close(done) can't race
-			// into the select.
-			signal.Stop(sigCh)
-			close(done)
+			select {
+			case <-sigCh:
+				logger.Warn("second signal received, forcing shutdown")
+				forced.Store(true)
+				srv.Stop()
+			case <-ctx.Done():
+				if ctx.Err() == context.DeadlineExceeded {
+					logger.Warn("graceful shutdown timed out, forcing stop")
+					forced.Store(true)
+					srv.Stop()
+				}
+			}
 		}()
 
-		select {
-		case <-done:
-			logger.Info("graceful shutdown complete")
-		case <-sigCh:
-			logger.Warn("second signal received, forcing shutdown")
-			srv.Stop()
-		case <-timer.C:
-			logger.Warn("graceful shutdown timed out, forcing stop")
-			srv.Stop()
-		}
+		srv.GracefulStop()
+		cancel() // Disarms the watchdog.
 	}()
 
 	logger.Info("listening", "addr", *listenAddr, "ca", *caCert, "cert", *serverCert)
@@ -99,6 +102,12 @@ func main() {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+
+	// Serve returns nil after GracefulStop or Stop.
+	if forced.Load() {
+		os.Exit(1)
+	}
+	logger.Info("server stopped")
 }
 
 // buildTLSConfig creates a TLS 1.3 mTLS configuration. The server
@@ -125,6 +134,5 @@ func buildTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
 		ClientCAs:    caPool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h2"},
 	}, nil
 }
