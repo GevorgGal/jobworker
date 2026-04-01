@@ -69,9 +69,16 @@ func main() {
 		timer := time.NewTimer(shutdownTimeout)
 		defer timer.Stop()
 
+		// GracefulStop waits for active RPCs to finish. Long-lived streams
+		// (e.g., StreamOutput) won't end on their own, so the shutdown timeout
+		// ensures we don't block forever.
 		done := make(chan struct{})
 		go func() {
 			srv.GracefulStop()
+			// Stop signal delivery before closing done so a second signal
+			// between GracefulStop returning and close(done) can't race
+			// into the select.
+			signal.Stop(sigCh)
 			close(done)
 		}()
 
@@ -85,11 +92,9 @@ func main() {
 			logger.Warn("graceful shutdown timed out, forcing stop")
 			srv.Stop()
 		}
-
-		signal.Stop(sigCh)
 	}()
 
-	logger.Info("listening", "addr", *listenAddr)
+	logger.Info("listening", "addr", *listenAddr, "ca", *caCert, "cert", *serverCert)
 	if err := srv.Serve(lis); err != nil {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
