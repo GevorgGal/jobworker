@@ -154,25 +154,15 @@ func collectOutput(t *testing.T, client pb.JobWorkerClient, jobID string) []byte
 	}
 }
 
-// awaitJobExit blocks until the job has fully terminated. It does this by
-// draining the output stream — when the stream returns EOF, the process
-// has exited and all output has been flushed.
-func awaitJobExit(t *testing.T, client pb.JobWorkerClient, jobID string) {
+// awaitJobExit blocks until the job has fully terminated using the
+// manager's WaitForExit — independent of streaming correctness.
+func awaitJobExit(t *testing.T, env *testEnv, jobID string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	stream, err := client.StreamOutput(ctx, &pb.StreamOutputRequest{JobId: jobID})
-	if err != nil {
-		t.Fatalf("awaitJobExit(%s): StreamOutput: %v", jobID, err)
-	}
-	for {
-		if _, err := stream.Recv(); err != nil {
-			if err == io.EOF {
-				return
-			}
-			t.Fatalf("awaitJobExit(%s): %v", jobID, err)
-		}
+	if err := env.manager.WaitForExit(ctx, jobID); err != nil {
+		t.Fatalf("awaitJobExit(%s): %v", jobID, err)
 	}
 }
 
@@ -239,7 +229,7 @@ func TestServer_Stop(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	awaitJobExit(t, env.client, id)
+	awaitJobExit(t, env, id)
 
 	st, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: id})
 	if err != nil {
@@ -259,7 +249,7 @@ func TestServer_StopAlreadyExited(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	awaitJobExit(t, env.client, resp.GetJobId())
+	awaitJobExit(t, env, resp.GetJobId())
 
 	_, err = env.client.Stop(ctx, &pb.StopRequest{JobId: resp.GetJobId()})
 	if got := status.Code(err); got != codes.FailedPrecondition {
@@ -324,7 +314,7 @@ func TestServer_GetStatusLifecycle(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	awaitJobExit(t, env.client, id)
+	awaitJobExit(t, env, id)
 
 	st, err = env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: id})
 	if err != nil {
@@ -350,7 +340,7 @@ func TestServer_GetStatusNaturalExit(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	awaitJobExit(t, env.client, resp.GetJobId())
+	awaitJobExit(t, env, resp.GetJobId())
 
 	st, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: resp.GetJobId()})
 	if err != nil {
@@ -475,7 +465,7 @@ func TestServer_StreamOutputReplay(t *testing.T) {
 	id := resp.GetJobId()
 
 	// Wait for job to complete.
-	awaitJobExit(t, env.client, id)
+	awaitJobExit(t, env, id)
 
 	// A new stream after completion should replay all output.
 	out := collectOutput(t, env.client, id)
@@ -665,7 +655,7 @@ func TestServer_AuthAdminAllowed(t *testing.T) {
 		t.Fatalf("admin Start: %v", err)
 	}
 
-	awaitJobExit(t, env.client, resp.GetJobId())
+	awaitJobExit(t, env, resp.GetJobId())
 
 	if _, err := env.client.GetStatus(ctx, &pb.GetStatusRequest{JobId: resp.GetJobId()}); err != nil {
 		t.Fatalf("admin GetStatus: %v", err)
