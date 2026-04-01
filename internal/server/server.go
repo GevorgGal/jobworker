@@ -113,8 +113,13 @@ func (s *Server) StreamOutput(req *pb.StreamOutputRequest, stream pb.JobWorker_S
 			}
 			// Context cancellation (client disconnect) or deadline exceeded.
 			// Return as-is; gRPC maps context errors to appropriate status codes.
-			s.logger.Debug("stream ended", "job_id", req.GetJobId(), "reason", err)
-			return err
+			if ctx.Err() != nil {
+				s.logger.Debug("stream ended", "job_id", req.GetJobId(), "reason", err)
+				return err
+			}
+			// Unexpected error — log and return generic message to avoid leaking details.
+			s.logger.Error("unexpected stream error", "job_id", req.GetJobId(), "error", err)
+			return status.Error(codes.Internal, "internal error")
 		}
 
 		if err := stream.Send(&pb.StreamOutputResponse{Data: data}); err != nil {
