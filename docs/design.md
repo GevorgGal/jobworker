@@ -25,7 +25,7 @@ Jobs are stored in a `map[string]*Job` protected by `sync.RWMutex`. Each job man
 
 _TODO: Add persistence layer so jobs survive server restarts._
 
-_TODO: Graceful server shutdown — stop accepting new RPCs, drain active streams with a timeout, then exit._
+The server handles graceful shutdown: on SIGTERM/SIGINT it stops all running jobs (marking output buffers done so streams receive EOF), then calls GracefulStop with a 10-second watchdog timeout.
 
 ### Project Layout
 

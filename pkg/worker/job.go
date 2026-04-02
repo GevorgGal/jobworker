@@ -2,6 +2,7 @@ package worker
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"sync"
@@ -11,8 +12,12 @@ import (
 type JobStatus int
 
 const (
+	// JobStatusUnspecified is the zero value, never set on a real job.
+	// It ensures callers who forget to check errors don't see a
+	// misleading "Running" status.
+	JobStatusUnspecified JobStatus = iota
 	// JobStatusRunning indicates the process is still executing.
-	JobStatusRunning JobStatus = iota
+	JobStatusRunning
 	// JobStatusExited indicates the process terminated on its own.
 	JobStatusExited
 	// JobStatusStopped indicates the process was terminated via Stop.
@@ -37,6 +42,10 @@ func (s JobStatus) String() string {
 // already terminated (either exited naturally or was previously stopped).
 var ErrAlreadyStopped = errors.New("job is already stopped")
 
+// ErrInvalidCommand is returned when the command cannot be started because
+// it was not found, does not exist, or is not executable.
+var ErrInvalidCommand = errors.New("invalid command")
+
 // Job represents a managed OS process with output capture.
 type Job struct {
 	mu       sync.Mutex
@@ -59,7 +68,10 @@ func startJob(id, command string, args []string) (*Job, error) {
 	cmd.Stderr = output
 
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		// Any Start failure means the process didn't launch — wrap uniformly.
+		// The underlying cause is in the message for diagnostics but not in
+		// the error chain, keeping exec internals out of the library's public API.
+		return nil, fmt.Errorf("%w: %v", ErrInvalidCommand, err)
 	}
 
 	j := &Job{

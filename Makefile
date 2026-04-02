@@ -1,4 +1,4 @@
-.PHONY: proto-gen certs test lint
+.PHONY: proto-gen certs build-server build-client build test lint
 
 # Regenerate after editing jobworker.proto. Commit the generated files.
 # Requires buf: https://buf.build/docs/installation
@@ -11,6 +11,14 @@ certs:
 	else \
 		cd certs && bash gen.sh; \
 	fi
+
+build-server:
+	go build -o bin/server ./cmd/server
+
+build-client:
+	go build -o bin/jobctl ./cmd/jobctl
+
+build: build-server build-client
 
 test:
 	go test -race ./...
