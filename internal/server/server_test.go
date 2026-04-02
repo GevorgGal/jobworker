@@ -577,14 +577,12 @@ func TestServer_StreamOutputConcurrentReaders(t *testing.T) {
 	const numReaders = 3
 	var wg sync.WaitGroup
 	for range numReaders {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			out := collectOutput(t, client, "job-1")
 			if got := string(out); got != want {
 				t.Errorf("reader got %q, want %q", got, want)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
